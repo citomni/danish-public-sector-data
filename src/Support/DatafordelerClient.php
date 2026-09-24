@@ -100,15 +100,7 @@ final class DatafordelerClient {
 			throw new \InvalidArgumentException('GraphQL query must be a non-empty string.');
 		}
 
-		try {
-			$apiKey = $this->app->secrets->get(self::API_KEY_SECRET);
-		} catch (\OutOfBoundsException) {
-			throw new AuthenticationException('Datafordeler API key is not configured.');
-		}
-
-		if ($apiKey === '') {
-			throw new AuthenticationException('Datafordeler API key is empty.');
-		}
+		$apiKey = $this->apiKey();
 
 		$payload = ['query' => $query];
 		if ($variables !== []) {
@@ -183,6 +175,26 @@ final class DatafordelerClient {
 		}
 
 		return $decoded['data'];
+	}
+
+	/**
+	 * Return the configured Datafordeler API key.
+	 *
+	 * @return string Non-empty API key.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\AuthenticationException When the API key is missing or empty.
+	 */
+	private function apiKey(): string {
+		try {
+			$apiKey = $this->app->secrets->get(self::API_KEY_SECRET);
+		} catch (\OutOfBoundsException) {
+			throw new AuthenticationException('Datafordeler API key is not configured.');
+		}
+
+		if ($apiKey === '') {
+			throw new AuthenticationException('Datafordeler API key is empty.');
+		}
+
+		return $apiKey;
 	}
 
 	/**

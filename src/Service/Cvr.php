@@ -24,8 +24,8 @@ use CitOmni\Kernel\Service\BaseService;
  *
  * Behavior:
  * - Looks up one company by its eight-digit CVR number through Datafordeler flexibleCurrent.
- * - Requests only the fields needed for the normalized company result.
- * - Prefers the registered location address and falls back to the postal address.
+ * - Returns normalized identity, status, addresses, contact data, industries, and company form.
+ * - Prefers the registered location address and keeps the explicit postal address separately.
  * - Returns null when no matching company exists.
  *
  * Notes:
@@ -73,6 +73,7 @@ final class Cvr extends BaseService {
 	 *     name:?string,
 	 *     status:?string,
 	 *     startDate:?string,
+	 *     endDate:?string,
 	 *     companyType:array{code:?string,name:?string}|null,
 	 *     address:array{
 	 *         type:?string,
@@ -88,7 +89,27 @@ final class Cvr extends BaseService {
 	 *         supplementaryCity:?string,
 	 *         countryCode:?string,
 	 *         freeText:?string
-	 *     }|null
+	 *     }|null,
+	 *     postalAddress:array{
+	 *         type:?string,
+	 *         formatted:?string,
+	 *         careOf:?string,
+	 *         street:?string,
+	 *         houseNumberFrom:?string,
+	 *         houseNumberTo:?string,
+	 *         floor:?string,
+	 *         door:?string,
+	 *         postalCode:?string,
+	 *         city:?string,
+	 *         supplementaryCity:?string,
+	 *         countryCode:?string,
+	 *         freeText:?string
+	 *     }|null,
+	 *     contact:array{email:?string,phone:?string,marketingProtected:?bool},
+	 *     industries:array{
+	 *         primary:array{code:string,name:string,sequence:int}|null,
+	 *         secondary:list<array{code:string,name:string,sequence:int}>
+	 *     }
 	 * }|null Normalized company data, or null when the CVR number does not exist.
 	 * @throws \InvalidArgumentException When the CVR number is not exactly eight digits.
 	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When the remote lookup fails or is malformed.
@@ -127,7 +148,20 @@ final class Cvr extends BaseService {
 		$entity = $this->firstConnectionNode($company['id_CVR_CVREnhed_id_ref'] ?? null, 'CVR entity relation');
 
 		$name = null;
-		$address = null;
+		$addresses = [
+			'address' => null,
+			'postalAddress' => null,
+		];
+		$contact = [
+			'email' => null,
+			'phone' => null,
+			'marketingProtected' => null,
+		];
+		$industries = [
+			'primary' => null,
+			'secondary' => [],
+		];
+
 		if ($entity !== null) {
 			$nameRelation = $entity['id_CVR_Navn_CVREnhedsId_ref'] ?? null;
 			if ($nameRelation !== null && !\is_array($nameRelation)) {
@@ -135,7 +169,13 @@ final class Cvr extends BaseService {
 			}
 			$name = \is_array($nameRelation) ? self::nullableString($nameRelation['vaerdi'] ?? null) : null;
 
-			$address = $this->normalizeAddress($entity['id_CVR_Adressering_CVREnhedsId_ref'] ?? null);
+			$addresses = $this->normalizeAddresses($entity['id_CVR_Adressering_CVREnhedsId_ref'] ?? null);
+			$contact = [
+				'email' => $this->normalizeValueRelation($entity['id_CVR_e_mailadresse_CVREnhedsId_ref'] ?? null, 'email relation'),
+				'phone' => $this->normalizeValueRelation($entity['id_CVR_Telefonnummer_CVREnhedsId_ref'] ?? null, 'phone relation'),
+				'marketingProtected' => $this->normalizeBooleanValueRelation($entity['id_CVR_Reklamebeskyttelse_CVREnhedsId_ref'] ?? null),
+			];
+			$industries = $this->normalizeIndustries($entity['id_CVR_Branche_CVREnhedsId_ref'] ?? null);
 		}
 
 		$companyType = $this->normalizeCompanyType($company['id_CVR_Virksomhedsform_CVREnhedsId_ref'] ?? null);
@@ -145,13 +185,17 @@ final class Cvr extends BaseService {
 			'name' => $name,
 			'status' => self::nullableString($company['status'] ?? null),
 			'startDate' => self::nullableString($company['virksomhedStartdato'] ?? null),
+			'endDate' => self::nullableString($company['virksomhedOphoersdato'] ?? null),
 			'companyType' => $companyType,
-			'address' => $address,
+			'address' => $addresses['address'],
+			'postalAddress' => $addresses['postalAddress'],
+			'contact' => $contact,
+			'industries' => $industries,
 		];
 	}
 
 	/**
-	 * Build the minimal flexibleCurrent query needed by getCompany().
+	 * Build the flexibleCurrent company-profile query used by getCompany().
 	 *
 	 * @param string $cvrNumber Validated eight-digit CVR number.
 	 * @return string GraphQL query document.
@@ -170,6 +214,7 @@ query GetCvrCompany {
 			status
 			CVRNummer
 			virksomhedStartdato
+			virksomhedOphoersdato
 			id_CVR_CVREnhed_id_ref(first: 1) {
 				nodes {
 					id_CVR_Navn_CVREnhedsId_ref {
@@ -197,6 +242,25 @@ query GetCvrCompany {
 							CVRAdresse_landekode
 							CVRAdresse_adresseFritekst
 						}
+					}
+					id_CVR_Branche_CVREnhedsId_ref(
+						first: 10
+						where: { sekvens: { in: [0, 1, 2, 3] } }
+					) {
+						nodes {
+							sekvens
+							vaerdi
+							vaerdiTekst
+						}
+					}
+					id_CVR_e_mailadresse_CVREnhedsId_ref {
+						vaerdi
+					}
+					id_CVR_Telefonnummer_CVREnhedsId_ref {
+						vaerdi
+					}
+					id_CVR_Reklamebeskyttelse_CVREnhedsId_ref {
+						vaerdi
 					}
 				}
 			}
@@ -243,9 +307,86 @@ GRAPHQL;
 	}
 
 	/**
-	 * Normalize the preferred CVR address from its GraphQL connection.
+	 * Normalize the registered location and postal addresses from one CVR relation.
+	 *
+	 * Behavior:
+	 * - Keeps the explicit postal address separately when CVR supplies one.
+	 * - Preserves the historical public `address` behavior by falling back to the postal address
+	 *   when no registered location address is available.
 	 *
 	 * @param mixed $relation Raw address relation.
+	 * @return array{
+	 *     address:array{
+	 *         type:?string,
+	 *         formatted:?string,
+	 *         careOf:?string,
+	 *         street:?string,
+	 *         houseNumberFrom:?string,
+	 *         houseNumberTo:?string,
+	 *         floor:?string,
+	 *         door:?string,
+	 *         postalCode:?string,
+	 *         city:?string,
+	 *         supplementaryCity:?string,
+	 *         countryCode:?string,
+	 *         freeText:?string
+	 *     }|null,
+	 *     postalAddress:array{
+	 *         type:?string,
+	 *         formatted:?string,
+	 *         careOf:?string,
+	 *         street:?string,
+	 *         houseNumberFrom:?string,
+	 *         houseNumberTo:?string,
+	 *         floor:?string,
+	 *         door:?string,
+	 *         postalCode:?string,
+	 *         city:?string,
+	 *         supplementaryCity:?string,
+	 *         countryCode:?string,
+	 *         freeText:?string
+	 *     }|null
+	 * } Normalized address set.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the relation shape is invalid.
+	 */
+	private function normalizeAddresses(mixed $relation): array {
+		if ($relation === null) {
+			return [
+				'address' => null,
+				'postalAddress' => null,
+			];
+		}
+		if (!\is_array($relation) || !\is_array($relation['nodes'] ?? null)) {
+			throw new InvalidResponseException('CVR response contains an invalid address relation.');
+		}
+
+		$location = null;
+		$postal = null;
+
+		foreach ($relation['nodes'] as $node) {
+			if (!\is_array($node)) {
+				throw new InvalidResponseException('CVR response contains an invalid address node.');
+			}
+
+			$type = self::nullableString($node['AdresseringAnvendelse'] ?? null);
+			if ($location === null && $type === 'beliggenhedsadresse') {
+				$location = $this->normalizeAddressNode($node);
+			}
+			if ($postal === null && $type === 'postadresse') {
+				$postal = $this->normalizeAddressNode($node);
+			}
+		}
+
+		return [
+			'address' => $location ?? $postal,
+			'postalAddress' => $postal,
+		];
+	}
+
+	/**
+	 * Normalize one CVR address node.
+	 *
+	 * @param array<string,mixed> $node Raw address node.
 	 * @return array{
 	 *     type:?string,
 	 *     formatted:?string,
@@ -260,40 +401,9 @@ GRAPHQL;
 	 *     supplementaryCity:?string,
 	 *     countryCode:?string,
 	 *     freeText:?string
-	 * }|null Normalized address or null when unavailable.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the relation shape is invalid.
+	 * } Normalized address.
 	 */
-	private function normalizeAddress(mixed $relation): ?array {
-		if ($relation === null) {
-			return null;
-		}
-		if (!\is_array($relation) || !\is_array($relation['nodes'] ?? null)) {
-			throw new InvalidResponseException('CVR response contains an invalid address relation.');
-		}
-
-		$preferred = null;
-		$fallback = null;
-
-		foreach ($relation['nodes'] as $node) {
-			if (!\is_array($node)) {
-				throw new InvalidResponseException('CVR response contains an invalid address node.');
-			}
-
-			$type = self::nullableString($node['AdresseringAnvendelse'] ?? null);
-			if ($type === 'beliggenhedsadresse') {
-				$preferred = $node;
-				break;
-			}
-			if ($fallback === null && $type === 'postadresse') {
-				$fallback = $node;
-			}
-		}
-
-		$node = $preferred ?? $fallback;
-		if ($node === null) {
-			return null;
-		}
-
+	private function normalizeAddressNode(array $node): array {
 		$address = [
 			'type' => self::nullableString($node['AdresseringAnvendelse'] ?? null),
 			'formatted' => null,
@@ -407,6 +517,127 @@ GRAPHQL;
 	}
 
 	/**
+	 * Normalize a to-one CVR relation containing a string value.
+	 *
+	 * @param mixed $relation Raw relation value.
+	 * @param string $label Safe relation label for diagnostics.
+	 * @return string|null Normalized relation value.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the relation shape is invalid.
+	 */
+	private function normalizeValueRelation(mixed $relation, string $label): ?string {
+		if ($relation === null) {
+			return null;
+		}
+		if (!\is_array($relation)) {
+			throw new InvalidResponseException('CVR response contains an invalid ' . $label . '.');
+		}
+
+		return self::requiredString($relation['vaerdi'] ?? null, $label . ' value');
+	}
+
+	/**
+	 * Normalize the CVR marketing-protection relation.
+	 *
+	 * @param mixed $relation Raw relation value.
+	 * @return bool|null Protection flag, or null when the relation is unavailable.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the relation shape or value is invalid.
+	 */
+	private function normalizeBooleanValueRelation(mixed $relation): ?bool {
+		if ($relation === null) {
+			return null;
+		}
+		if (!\is_array($relation)) {
+			throw new InvalidResponseException('CVR response contains an invalid marketing protection relation.');
+		}
+
+		if (!\array_key_exists('vaerdi', $relation)) {
+			throw new InvalidResponseException('CVR response contains a missing marketing protection value.');
+		}
+
+		$value = $relation['vaerdi'];
+		if (!\is_bool($value)) {
+			throw new InvalidResponseException('CVR response contains an invalid marketing protection value.');
+		}
+
+		return $value;
+	}
+
+	/**
+	 * Normalize current CVR branch data into primary and secondary industries.
+	 *
+	 * Notes:
+	 * - CVR sequence 0 is the primary industry.
+	 * - Sequences 1 through 3 are secondary industries.
+	 * - Results are sorted by sequence so the public output is deterministic.
+	 *
+	 * @param mixed $relation Raw branch connection.
+	 * @return array{
+	 *     primary:array{code:string,name:string,sequence:int}|null,
+	 *     secondary:list<array{code:string,name:string,sequence:int}>
+	 * } Normalized industries.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the relation shape or node values are invalid.
+	 */
+	private function normalizeIndustries(mixed $relation): array {
+		if ($relation === null) {
+			return [
+				'primary' => null,
+				'secondary' => [],
+			];
+		}
+		if (!\is_array($relation) || !\is_array($relation['nodes'] ?? null)) {
+			throw new InvalidResponseException('CVR response contains an invalid industry relation.');
+		}
+
+		$industries = [];
+		$seenSequences = [];
+		foreach ($relation['nodes'] as $node) {
+			if (!\is_array($node)) {
+				throw new InvalidResponseException('CVR response contains an invalid industry node.');
+			}
+
+			$sequence = self::requiredInt($node['sekvens'] ?? null, 'industry sequence');
+			if ($sequence < 0 || $sequence > 3) {
+				throw new InvalidResponseException('CVR response contains an unexpected industry sequence.');
+			}
+			if (isset($seenSequences[$sequence])) {
+				throw new InvalidResponseException('CVR response contains a duplicate industry sequence.');
+			}
+			$seenSequences[$sequence] = true;
+
+			$industries[] = [
+				'code' => self::requiredString($node['vaerdi'] ?? null, 'industry code'),
+				'name' => self::requiredString($node['vaerdiTekst'] ?? null, 'industry name'),
+				'sequence' => $sequence,
+			];
+		}
+
+		\usort($industries, static function(array $left, array $right): int {
+			$sequenceOrder = $left['sequence'] <=> $right['sequence'];
+
+			return $sequenceOrder !== 0 ? $sequenceOrder : $left['code'] <=> $right['code'];
+		});
+
+		$primary = null;
+		$secondary = [];
+		foreach ($industries as $industry) {
+			if ($industry['sequence'] === 0) {
+				if ($primary !== null) {
+					throw new InvalidResponseException('CVR response contains multiple primary industries.');
+				}
+				$primary = $industry;
+				continue;
+			}
+
+			$secondary[] = $industry;
+		}
+
+		return [
+			'primary' => $primary,
+			'secondary' => $secondary,
+		];
+	}
+
+	/**
 	 * Normalize the CVR company-form relation.
 	 *
 	 * @param mixed $relation Raw company-form relation.
@@ -425,6 +656,42 @@ GRAPHQL;
 			'code' => self::nullableString($relation['vaerdi'] ?? null),
 			'name' => self::nullableString($relation['vaerdiTekst'] ?? null),
 		];
+	}
+
+	/**
+	 * Normalize a required upstream scalar to a non-empty string.
+	 *
+	 * @param mixed $value Raw upstream value.
+	 * @param string $label Safe value label for diagnostics.
+	 * @return string Non-empty string value.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the value is missing or invalid.
+	 */
+	private static function requiredString(mixed $value, string $label): string {
+		$normalized = self::nullableString($value);
+		if ($normalized === null || $normalized === '') {
+			throw new InvalidResponseException('CVR response contains a missing ' . $label . '.');
+		}
+
+		return $normalized;
+	}
+
+	/**
+	 * Normalize a required upstream integer.
+	 *
+	 * @param mixed $value Raw upstream value.
+	 * @param string $label Safe value label for diagnostics.
+	 * @return int Integer value.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the value is missing or invalid.
+	 */
+	private static function requiredInt(mixed $value, string $label): int {
+		if (\is_int($value)) {
+			return $value;
+		}
+		if (\is_string($value) && \preg_match('/^-?[0-9]+$/D', $value) && (string)(int)$value === $value) {
+			return (int)$value;
+		}
+
+		throw new InvalidResponseException('CVR response contains an invalid ' . $label . '.');
 	}
 
 	/**

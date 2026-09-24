@@ -86,8 +86,9 @@ Result shape:
 [
 	'cvrNumber' => '12345678',
 	'name' => 'Example ApS',
-	'status' => 'NORMAL',
+	'status' => 'aktiv',
 	'startDate' => '2020-01-01',
+	'endDate' => null,
 	'companyType' => [
 		'code' => '80',
 		'name' => 'Anpartsselskab',
@@ -107,6 +108,20 @@ Result shape:
 		'countryCode' => 'DK',
 		'freeText' => null,
 	],
+	'postalAddress' => null,
+	'contact' => [
+		'email' => 'info@example.test',
+		'phone' => '12345678',
+		'marketingProtected' => false,
+	],
+	'industries' => [
+		'primary' => [
+			'code' => '000000',
+			'name' => 'Example industry',
+			'sequence' => 0,
+		],
+		'secondary' => [],
+	],
 ]
 ```
 
@@ -115,6 +130,16 @@ upstream query returns no company node. Integration failures throw exceptions
 from `CitOmni\DanishPublicSectorData\Exception`. The `address.formatted` value is
 built locally from the normalized CVR address fields; Datafordeler's upstream
 `Adresse` value is a DAR address reference rather than formatted display text.
+
+`address` continues to prefer the registered location address and falls back to the
+postal address for backwards-compatible lookup behavior. `postalAddress` exposes the
+postal address explicitly when CVR supplies one. Industry sequence `0` is normalized as
+the primary industry; sequences `1` through `3` are returned as secondary industries.
+
+The company lookup intentionally does not infer accounting year, VAT registration,
+capital, purpose, signing rules, or other values that are not exposed by the selected
+CVR GraphQL contract. Consumers should obtain those values from an appropriate source
+or ask the user instead of deriving them from unrelated CVR fields.
 
 The current default uses Datafordeler `flexibleCurrent/v3`. Host applications can
 override the endpoint selection through the normal CitOmni configuration flow:
