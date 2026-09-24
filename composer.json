@@ -1,0 +1,57 @@
+{
+    "name": "citomni/danish-public-sector-data",
+    "description": "Reusable CitOmni clients for authoritative data services provided by the Danish public sector.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": [
+        "citomni",
+        "provider",
+        "denmark",
+        "danish",
+        "public-sector",
+        "public-data",
+        "government-data",
+        "datafordeler"
+    ],
+    "homepage": "https://github.com/citomni/danish-public-sector-data",
+    "support": {
+        "email": "lars@grove-mortensen.dk",
+        "issues": "https://github.com/citomni/danish-public-sector-data/issues",
+        "source": "https://github.com/citomni/danish-public-sector-data",
+        "docs": "https://github.com/citomni/danish-public-sector-data/blob/main/README.md",
+        "security": "https://github.com/citomni/.github/blob/main/SECURITY.md"
+    },
+    "require": {
+        "php": "^8.5",
+        "citomni/kernel": "^1.0",
+        "citomni/infrastructure": "^1.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "CitOmni\\DanishPublicSectorData\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "CitOmni\\DanishPublicSectorData\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true,
+    "authors": [
+        {
+            "name": "Lars Grove Mortensen",
+            "email": "lars@grove-mortensen.dk",
+            "homepage": "https://www.citomni.com",
+            "role": "Developer"
+        }
+    ],
+	"extra": {
+		"branch-alias": {
+			"dev-main": "1.0.x-dev"
+		}
+	}
+}
