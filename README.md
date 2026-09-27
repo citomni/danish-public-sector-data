@@ -136,10 +136,9 @@ postal address for backwards-compatible lookup behavior. `postalAddress` exposes
 postal address explicitly when CVR supplies one. Industry sequence `0` is normalized as
 the primary industry; sequences `1` through `3` are returned as secondary industries.
 
-The company lookup intentionally does not infer accounting year, VAT registration,
-capital, purpose, signing rules, or other values that are not exposed by the selected
-CVR GraphQL contract. Consumers should obtain those values from an appropriate source
-or ask the user instead of deriving them from unrelated CVR fields.
+The normalized `getCompany()` contract intentionally remains limited to fields exposed by
+the selected Datafordeler GraphQL contract. Source-specific payloads are not part of
+`getCompany()` and must not leak into application persistence contracts.
 
 The current default uses Datafordeler `flexibleCurrent/v3`. Host applications can
 override the endpoint selection through the normal CitOmni configuration flow:
@@ -158,6 +157,28 @@ return [
 A service-version change that also changes the GraphQL schema may require a package
 update; overriding the version does not make incompatible schemas compatible.
 
+## VAT registration lookup
+
+The provider also exposes `vatRegistration`. Its current implementation checks one exact
+CVR/SE number through SKAT's anonymous public VAT-number web lookup:
+
+```php
+$status = $this->app->vatRegistration->getStatus('12345678');
+```
+
+The normalized result contains the queried number, the decisive current registration state,
+the displayed verification date when available, and `skat.dk` as source. The web transport
+is deliberately isolated because the public SKAT page is not a documented API contract.
+No CAPTCHA, login, or access control is bypassed. The exact queried CVR/SE number is retained
+because a legal CVR number may use separate administrative SE numbers for VAT registration.
+
+The parser smoke test covers the observed CVR/SE search controls plus decisive positive and
+negative result wording without making a live network request:
+
+```bash
+php tests/skat_vat_web_parser_test.php
+```
+
 ## Internal Datafordeler client
 
 Datafordeler authentication and GraphQL transport are internal package concerns.
@@ -172,7 +193,9 @@ OAuth and access-restricted datasets are deliberately outside the initial scope.
 The provider keeps the boundaries intentionally small:
 
 - `Service\Cvr` is the public CVR capability and owns CVR-specific queries and normalization.
+- `Service\VatRegistration` is the public VAT-registration status capability.
 - `Support\DatafordelerClient` owns Datafordeler authentication, GraphQL transport, response validation, and safe exception translation.
+- `Support\SkatVatWebClient` isolates the temporary public SKAT web-flow transport details.
 - `Exception` contains transport-agnostic integration failure semantics.
 - No SQL, HTTP controller behavior, or CLI output belongs in these services.
 
@@ -182,9 +205,10 @@ artificial generic abstraction.
 
 ## Configuration and services
 
-The provider contributes one shared service ID:
+The provider contributes two shared service IDs:
 
 - `cvr`
+- `vatRegistration`
 
 Internal transport helpers are not registered as host-app services.
 

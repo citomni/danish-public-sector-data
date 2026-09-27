@@ -52,6 +52,7 @@ final class Registry {
 	 */
 	public const array MAP_COMMON = [
 		'cvr' => \CitOmni\DanishPublicSectorData\Service\Cvr::class,
+		'vatRegistration' => \CitOmni\DanishPublicSectorData\Service\VatRegistration::class,
 	];
 
 	/**
@@ -88,6 +89,11 @@ final class Registry {
 		'danish_public_sector_data' => [
 			'datafordeler' => [
 				'base_url' => 'https://graphql.datafordeler.dk',
+				'timeout' => 15,
+				'connect_timeout' => 5,
+			],
+			'skat_vat_web' => [
+				'search_url' => 'https://ntse.skat.dk/ntse-front/public/momsnummer/soeg',
 				'timeout' => 15,
 				'connect_timeout' => 5,
 			],
