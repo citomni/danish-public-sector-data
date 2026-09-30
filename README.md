@@ -106,6 +106,11 @@ units, floors, entrances, and technical installations. Each physical BBR object 
 `scope` value so context objects such as an owner apartment's host building or a BPFG property's
 underlying ground are not presented as directly belonging to the requested property.
 
+Bundled BBR code-list labels are returned next to their authoritative `...Code` values,
+including municipality names, floor types, elevator state, and house-number roles. Unknown codes
+keep a null label so consumers can fall back to the raw value without guessing.
+`codeListSnapshotDate` identifies the bundled code-list snapshot used for the labels.
+
 Technical-installation history is opt-in:
 
 ```php

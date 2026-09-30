@@ -17,6 +17,7 @@ namespace CitOmni\DanishPublicSectorData\Service;
 
 use CitOmni\DanishPublicSectorData\Exception\InvalidResponseException;
 use CitOmni\DanishPublicSectorData\Support\DatafordelerClient;
+use CitOmni\DanishPublicSectorData\Util\BbrCodeLists;
 use CitOmni\Kernel\Service\BaseService;
 
 /**
@@ -34,7 +35,7 @@ use CitOmni\Kernel\Service\BaseService;
  * - Address resolution never silently chooses between ambiguous BFE candidates.
  * - A selected owner-apartment unit takes precedence over the underlying SFE candidate.
  * - Public result shapes use package-owned keys rather than upstream GraphQL field names.
- * - BBR code values are preserved as codes; applications may map them to labels separately.
+ * - BBR code values remain authoritative while bundled snapshot labels are returned additively.
  *
  * Typical usage:
  *   $resolution = $this->app->bbr->resolveAddress('Nørmarkvej 29, 2 22, 7600 Struer');
@@ -275,8 +276,11 @@ final class Bbr extends BaseService {
 	 *     bfeNumber:int,
 	 *     propertyRelationId:string,
 	 *     propertyType:string,
+	 *     codeListSnapshotDate:string,
 	 *     statusCode:?string,
+	 *     statusLabel:?string,
 	 *     ownerTypeCode:?string,
+	 *     ownerTypeLabel:?string,
 	 *     legacyPropertyNumber:?int,
 	 *     ownerApartmentNumber:?int,
 	 *     registeredArea:?int,
@@ -330,8 +334,11 @@ final class Bbr extends BaseService {
 			'bfeNumber' => $bfe,
 			'propertyRelationId' => $propertyId,
 			'propertyType' => $kind,
+			'codeListSnapshotDate' => BbrCodeLists::SNAPSHOT_DATE,
 			'statusCode' => self::nullableString($property['status'] ?? null),
+			'statusLabel' => self::codeLabel('Livscyklus', $property['status'] ?? null),
 			'ownerTypeCode' => self::nullableString($property['ejendommensEjerforholdskode'] ?? null),
+			'ownerTypeLabel' => self::codeLabel('Ejerforholdskode', $property['ejendommensEjerforholdskode'] ?? null),
 			'legacyPropertyNumber' => self::nullableInt($property['ejendomsnummer'] ?? null),
 			'ownerApartmentNumber' => self::nullableInt($property['ejerlejlighedsnummer'] ?? null),
 			'registeredArea' => self::nullableInt($property['tinglystAreal'] ?? null),
@@ -1778,14 +1785,21 @@ final class Bbr extends BaseService {
 			'id' => self::requiredUuid($node['id_lokalId'] ?? null, 'BBR ground id'),
 			'scope' => $scope,
 			'statusCode' => self::nullableString($node['status'] ?? null),
+			'statusLabel' => self::codeLabel('Livscyklus', $node['status'] ?? null),
 			'propertyRelationId' => self::nullableString($node['bestemtFastEjendom'] ?? null),
 			'houseNumberId' => self::nullableString($node['husnummer'] ?? null),
 			'municipalityCode' => self::nullableString($node['kommunekode'] ?? null),
+			'municipalityLabel' => self::codeLabel('Kommunekode', $node['kommunekode'] ?? null),
 			'waterSupplyCode' => self::nullableString($node['gru009Vandforsyning'] ?? null),
+			'waterSupplyLabel' => self::codeLabel('Vandforsyning', $node['gru009Vandforsyning'] ?? null),
 			'drainageCode' => self::nullableString($node['gru010Afloebsforhold'] ?? null),
+			'drainageLabel' => self::codeLabel('Afloebsforhold', $node['gru010Afloebsforhold'] ?? null),
 			'dischargePermitCode' => self::nullableString($node['gru021Udledningstilladelse'] ?? null),
+			'dischargePermitLabel' => self::codeLabel('Udledningstilladelse', $node['gru021Udledningstilladelse'] ?? null),
 			'wastewaterMembershipCode' => self::nullableString($node['gru022MedlemskabAfSpildevandsforsyning'] ?? null),
+			'wastewaterMembershipLabel' => self::codeLabel('MedlemsskabAfSplidevandforsyning', $node['gru022MedlemskabAfSpildevandsforsyning'] ?? null),
 			'wastewaterOrderCode' => self::nullableString($node['gru023PaabudVedrSpildevandsafledning'] ?? null),
+			'wastewaterOrderLabel' => self::codeLabel('Rensningspaabud', $node['gru023PaabudVedrSpildevandsafledning'] ?? null),
 			'registeredFrom' => self::nullableString($node['registreringFra'] ?? null),
 			'registeredTo' => self::nullableString($node['registreringTil'] ?? null),
 			'validFrom' => self::nullableString($node['virkningFra'] ?? null),
@@ -1801,24 +1815,34 @@ final class Bbr extends BaseService {
 			'id' => self::requiredUuid($node['id_lokalId'] ?? null, 'BBR building id'),
 			'scope' => $scope,
 			'statusCode' => self::nullableString($node['status'] ?? null),
+			'statusLabel' => self::codeLabel('Livscyklus', $node['status'] ?? null),
 			'houseNumberId' => self::nullableString($node['husnummer'] ?? null),
 			'groundId' => self::nullableString($node['grund'] ?? null),
 			'landParcelId' => self::nullableString($node['jordstykke'] ?? null),
 			'ownerApartmentPropertyRelationId' => self::nullableString($node['ejerlejlighed'] ?? null),
 			'buildingNumber' => self::nullableInt($node['byg007Bygningsnummer'] ?? null),
 			'applicationCode' => self::nullableString($node['byg021BygningensAnvendelse'] ?? null),
+			'applicationLabel' => self::codeLabel('BygAnvendelse', $node['byg021BygningensAnvendelse'] ?? null),
 			'apartmentsWithKitchen' => self::nullableInt($node['byg024AntalLejlighederMedKoekken'] ?? null),
 			'apartmentsWithoutKitchen' => self::nullableInt($node['byg025AntalLejlighederUdenKoekken'] ?? null),
 			'constructionYear' => self::nullableInt($node['byg026Opfoerelsesaar'] ?? null),
 			'remodelYear' => self::nullableInt($node['byg027OmTilbygningsaar'] ?? null),
 			'waterSupplyCode' => self::nullableString($node['byg030Vandforsyning'] ?? null),
+			'waterSupplyLabel' => self::codeLabel('Vandforsyning', $node['byg030Vandforsyning'] ?? null),
 			'drainageCode' => self::nullableString($node['byg031Afloebsforhold'] ?? null),
+			'drainageLabel' => self::codeLabel('Afloebsforhold', $node['byg031Afloebsforhold'] ?? null),
 			'outerWallMaterialCode' => self::nullableString($node['byg032YdervaeggensMateriale'] ?? null),
+			'outerWallMaterialLabel' => self::codeLabel('YdervaeggenesMateriale', $node['byg032YdervaeggensMateriale'] ?? null),
 			'roofMaterialCode' => self::nullableString($node['byg033Tagdaekningsmateriale'] ?? null),
+			'roofMaterialLabel' => self::codeLabel('Tagdaekningsmateriale', $node['byg033Tagdaekningsmateriale'] ?? null),
 			'supplementaryOuterWallMaterialCode' => self::nullableString($node['byg034SupplerendeYdervaeggensMateriale'] ?? null),
+			'supplementaryOuterWallMaterialLabel' => self::codeLabel('YdervaeggenesMateriale', $node['byg034SupplerendeYdervaeggensMateriale'] ?? null),
 			'supplementaryRoofMaterialCode' => self::nullableString($node['byg035SupplerendeTagdaekningsMateriale'] ?? null),
+			'supplementaryRoofMaterialLabel' => self::codeLabel('Tagdaekningsmateriale', $node['byg035SupplerendeTagdaekningsMateriale'] ?? null),
 			'asbestosCode' => self::nullableString($node['byg036AsbestholdigtMateriale'] ?? null),
+			'asbestosLabel' => self::codeLabel('AsbestholdigtMateriale', $node['byg036AsbestholdigtMateriale'] ?? null),
 			'materialSourceCode' => self::nullableString($node['byg037KildeTilBygningensMaterialer'] ?? null),
+			'materialSourceLabel' => self::codeLabel('KildeTilOplysninger', $node['byg037KildeTilBygningensMaterialer'] ?? null),
 			'totalArea' => self::nullableInt($node['byg038SamletBygningsareal'] ?? null),
 			'residentialArea' => self::nullableInt($node['byg039BygningensSamledeBoligAreal'] ?? null),
 			'businessArea' => self::nullableInt($node['byg040BygningensSamledeErhvervsAreal'] ?? null),
@@ -1829,11 +1853,16 @@ final class Bbr extends BaseService {
 			'integratedConservatoryArea' => self::nullableInt($node['byg045ArealIndbyggetUdestueEllerLign'] ?? null),
 			'coveredArea' => self::nullableInt($node['byg049ArealAfOverdaekketAreal'] ?? null),
 			'areaSourceCode' => self::nullableString($node['byg053BygningsarealerKilde'] ?? null),
+			'areaSourceLabel' => self::codeLabel('KildeTilOplysninger', $node['byg053BygningsarealerKilde'] ?? null),
 			'floorCount' => self::nullableInt($node['byg054AntalEtager'] ?? null),
 			'heatingInstallationCode' => self::nullableString($node['byg056Varmeinstallation'] ?? null),
+			'heatingInstallationLabel' => self::codeLabel('Varmeinstallation', $node['byg056Varmeinstallation'] ?? null),
 			'heatingMediumCode' => self::nullableString($node['byg057Opvarmningsmiddel'] ?? null),
+			'heatingMediumLabel' => self::codeLabel('Opvarmningsmiddel', $node['byg057Opvarmningsmiddel'] ?? null),
 			'supplementaryHeatingCode' => self::nullableString($node['byg058SupplerendeVarme'] ?? null),
+			'supplementaryHeatingLabel' => self::codeLabel('SupplerendeVarme', $node['byg058SupplerendeVarme'] ?? null),
 			'preservationCode' => self::nullableString($node['byg070Fredning'] ?? null),
+			'preservationLabel' => self::codeLabel('Fredning', $node['byg070Fredning'] ?? null),
 			'preservationReference' => self::nullableString($node['byg071BevaringsvaerdighedReference'] ?? null),
 			'notes' => self::nullableString($node['byg500Notatlinjer'] ?? null),
 			'registeredFrom' => self::nullableString($node['registreringFra'] ?? null),
@@ -1851,24 +1880,35 @@ final class Bbr extends BaseService {
 			'id' => self::requiredUuid($node['id_lokalId'] ?? null, 'BBR unit id'),
 			'scope' => $scope,
 			'statusCode' => self::nullableString($node['status'] ?? null),
+			'statusLabel' => self::codeLabel('Livscyklus', $node['status'] ?? null),
 			'addressId' => self::nullableString($node['adresseIdentificerer'] ?? null),
 			'buildingId' => self::nullableString($node['bygning'] ?? null),
 			'floorId' => self::nullableString($node['etage'] ?? null),
 			'entranceId' => self::nullableString($node['opgang'] ?? null),
 			'applicationCode' => self::nullableString($node['enh020EnhedensAnvendelse'] ?? null),
+			'applicationLabel' => self::codeLabel('EnhAnvendelse', $node['enh020EnhedensAnvendelse'] ?? null),
 			'housingTypeCode' => self::nullableString($node['enh023Boligtype'] ?? null),
+			'housingTypeLabel' => self::codeLabel('Boligtype', $node['enh023Boligtype'] ?? null),
 			'totalArea' => self::nullableInt($node['enh026EnhedensSamledeAreal'] ?? null),
 			'residentialArea' => self::nullableInt($node['enh027ArealTilBeboelse'] ?? null),
 			'businessArea' => self::nullableInt($node['enh028ArealTilErhverv'] ?? null),
 			'roomCount' => self::nullableInt($node['enh031AntalVaerelser'] ?? null),
 			'toiletCode' => self::nullableString($node['enh032Toiletforhold'] ?? null),
+			'toiletLabel' => self::codeLabel('Toiletforhold', $node['enh032Toiletforhold'] ?? null),
 			'bathCode' => self::nullableString($node['enh033Badeforhold'] ?? null),
+			'bathLabel' => self::codeLabel('Badeforhold', $node['enh033Badeforhold'] ?? null),
 			'kitchenCode' => self::nullableString($node['enh034Koekkenforhold'] ?? null),
+			'kitchenLabel' => self::codeLabel('Koekkenforhold', $node['enh034Koekkenforhold'] ?? null),
 			'energySupplyCode' => self::nullableString($node['enh035Energiforsyning'] ?? null),
+			'energySupplyLabel' => self::codeLabel('Energiforsyning', $node['enh035Energiforsyning'] ?? null),
 			'rentalCode' => self::nullableString($node['enh045Udlejningsforhold'] ?? null),
+			'rentalLabel' => self::codeLabel('Udlejningsforhold', $node['enh045Udlejningsforhold'] ?? null),
 			'heatingInstallationCode' => self::nullableString($node['enh051Varmeinstallation'] ?? null),
+			'heatingInstallationLabel' => self::codeLabel('Varmeinstallation', $node['enh051Varmeinstallation'] ?? null),
 			'heatingMediumCode' => self::nullableString($node['enh052Opvarmningsmiddel'] ?? null),
+			'heatingMediumLabel' => self::codeLabel('Opvarmningsmiddel', $node['enh052Opvarmningsmiddel'] ?? null),
 			'supplementaryHeatingCode' => self::nullableString($node['enh053SupplerendeVarme'] ?? null),
+			'supplementaryHeatingLabel' => self::codeLabel('SupplerendeVarme', $node['enh053SupplerendeVarme'] ?? null),
 			'registeredFrom' => self::nullableString($node['registreringFra'] ?? null),
 			'registeredTo' => self::nullableString($node['registreringTil'] ?? null),
 			'validFrom' => self::nullableString($node['virkningFra'] ?? null),
@@ -1884,6 +1924,7 @@ final class Bbr extends BaseService {
 			'id' => self::requiredUuid($node['id_lokalId'] ?? null, 'BBR floor id'),
 			'scope' => $scope,
 			'statusCode' => self::nullableString($node['status'] ?? null),
+			'statusLabel' => self::codeLabel('Livscyklus', $node['status'] ?? null),
 			'buildingId' => self::nullableString($node['bygning'] ?? null),
 			'label' => self::nullableString($node['eta006BygningensEtagebetegnelse'] ?? null),
 			'totalArea' => self::nullableInt($node['eta020SamletArealAfEtage'] ?? null),
@@ -1891,6 +1932,7 @@ final class Bbr extends BaseService {
 			'basementArea' => self::nullableInt($node['eta022Kaelderareal'] ?? null),
 			'legalBasementResidentialArea' => self::nullableInt($node['eta023ArealAfLovligBeboelseIKaelder'] ?? null),
 			'typeCode' => self::nullableString($node['eta025Etagetype'] ?? null),
+			'typeLabel' => self::codeLabel('EtageType', $node['eta025Etagetype'] ?? null),
 			'registeredFrom' => self::nullableString($node['registreringFra'] ?? null),
 			'registeredTo' => self::nullableString($node['registreringTil'] ?? null),
 			'validFrom' => self::nullableString($node['virkningFra'] ?? null),
@@ -1906,10 +1948,13 @@ final class Bbr extends BaseService {
 			'id' => self::requiredUuid($node['id_lokalId'] ?? null, 'BBR entrance id'),
 			'scope' => $scope,
 			'statusCode' => self::nullableString($node['status'] ?? null),
+			'statusLabel' => self::codeLabel('Livscyklus', $node['status'] ?? null),
 			'buildingId' => self::nullableString($node['bygning'] ?? null),
 			'houseNumberId' => self::nullableString($node['adgangFraHusnummer'] ?? null),
 			'elevatorCode' => self::nullableString($node['opg020Elevator'] ?? null),
+			'elevatorLabel' => self::codeLabel('Elevator', $node['opg020Elevator'] ?? null),
 			'houseNumberFunctionCode' => self::nullableString($node['opg021HusnummerFunktion'] ?? null),
+			'houseNumberFunctionLabel' => self::codeLabel('HusnummerRolle', $node['opg021HusnummerFunktion'] ?? null),
 			'registeredFrom' => self::nullableString($node['registreringFra'] ?? null),
 			'registeredTo' => self::nullableString($node['registreringTil'] ?? null),
 			'validFrom' => self::nullableString($node['virkningFra'] ?? null),
@@ -1927,6 +1972,7 @@ final class Bbr extends BaseService {
 			'id' => self::requiredUuid($node['id_lokalId'] ?? null, 'BBR technical-installation id'),
 			'scope' => $scope,
 			'statusCode' => self::nullableString($node['status'] ?? null),
+			'statusLabel' => self::codeLabel('Livscyklus', $node['status'] ?? null),
 			'houseNumberId' => self::nullableString($node['husnummer'] ?? null),
 			'buildingId' => self::nullableString($node['bygning'] ?? null),
 			'groundId' => self::nullableString($node['grund'] ?? null),
@@ -1936,25 +1982,33 @@ final class Bbr extends BaseService {
 			'ownerApartmentPropertyRelationId' => self::nullableString($node['ejerlejlighed'] ?? null),
 			'installationNumber' => self::nullableInt($node['tek007Anlaegsnummer'] ?? null),
 			'classificationCode' => self::nullableString($node['tek020Klassifikation'] ?? null),
+			'classificationLabel' => self::codeLabel('Klassifikation', $node['tek020Klassifikation'] ?? null),
 			'makeType' => self::nullableString($node['tek021FabrikatType'] ?? null),
 			'establishmentYear' => self::nullableInt($node['tek024Etableringsaar'] ?? null),
 			'remodelYear' => self::nullableInt($node['tek025TilOmbygningsaar'] ?? null),
 			'oilTankSizeClassCode' => self::nullableString($node['tek026StoerrelsesklasseOlietank'] ?? null),
+			'oilTankSizeClassLabel' => self::codeLabel('Stoerrelsesklasse', $node['tek026StoerrelsesklasseOlietank'] ?? null),
 			'placementCode' => self::nullableString($node['tek027Placering'] ?? null),
+			'placementLabel' => self::codeLabel('Placering', $node['tek027Placering'] ?? null),
 			'oilTankDecommissionCode' => self::nullableString($node['tek028SloejfningOlietank'] ?? null),
+			'oilTankDecommissionLabel' => self::codeLabel('Sloejfning', $node['tek028SloejfningOlietank'] ?? null),
 			'serialNumber' => self::nullableString($node['tek030Fabrikationsnummer'] ?? null),
 			'typeApprovalNumber' => self::nullableString($node['tek031Typegodkendelsesnummer'] ?? null),
 			'size' => self::nullableInt($node['tek032Stoerrelse'] ?? null),
 			'typeCode' => self::nullableString($node['tek033Type'] ?? null),
+			'typeLabel' => self::codeLabel('TypeAfVaegge', $node['tek033Type'] ?? null),
 			'oilTankContentCode' => self::nullableString($node['tek034IndholdOlietank'] ?? null),
+			'oilTankContentLabel' => self::codeLabel('Indhold', $node['tek034IndholdOlietank'] ?? null),
 			'oilTankDecommissionDeadline' => self::nullableString($node['tek035SloejfningsfristOlietank'] ?? null),
 			'volume' => self::nullableInt($node['tek036Rumfang'] ?? null),
 			'productionYear' => self::nullableInt($node['tek067Fabrikationsaar'] ?? null),
 			'materialCode' => self::nullableString($node['tek068Materiale'] ?? null),
+			'materialLabel' => self::codeLabel('Materiale', $node['tek068Materiale'] ?? null),
 			'decommissionYear' => self::nullableInt($node['tek072Sloejfningsaar'] ?? null),
 			'tankCovering' => self::nullableString($node['tek105OverdaekningTank'] ?? null),
 			'tankInspectionDate' => self::nullableString($node['tek106InspektionsdatoTank'] ?? null),
 			'operatingStatusCode' => self::nullableString($node['tek110Driftstatus'] ?? null),
+			'operatingStatusLabel' => self::codeLabel('Driftstatus', $node['tek110Driftstatus'] ?? null),
 			'lastInspectionDate' => self::nullableString($node['tek111DatoForSenesteInspektion'] ?? null),
 			'coordinate' => \is_array($coordinate)
 				? [
@@ -2121,6 +2175,19 @@ final class Bbr extends BaseService {
 		if (\is_string($value) && self::isUuid($value)) {
 			$set[$value] = true;
 		}
+	}
+
+	/**
+	 * Resolve an optional BBR code through the bundled code-list snapshot.
+	 *
+	 * @param string $list Official BBR code-list name.
+	 * @param mixed $value Raw upstream code value.
+	 * @return string|null Snapshot label, or null when the value or mapping is unavailable.
+	 */
+	private static function codeLabel(string $list, mixed $value): ?string {
+		$code = self::nullableString($value);
+
+		return BbrCodeLists::label($list, $code);
 	}
 
 	/**

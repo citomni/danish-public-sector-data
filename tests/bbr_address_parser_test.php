@@ -30,6 +30,7 @@ namespace {
 
 	require_once $root . '/src/Exception/PublicDataException.php';
 	require_once $root . '/src/Exception/InvalidResponseException.php';
+	require_once $root . '/src/Util/BbrCodeLists.php';
 	require_once $root . '/src/Service/Bbr.php';
 
 	$service = (new \ReflectionClass(Bbr::class))->newInstanceWithoutConstructor();
@@ -111,6 +112,27 @@ namespace {
 	]);
 	$check($selection['status'] === 'unit_exact', 'Floor/door selects one exact DAR address.');
 	$check(($selection['selected']['id_lokalId'] ?? null) === '00000000-0000-0000-0000-000000000012', 'Correct unit address is selected.');
+
+
+	$ground = $invoke('normalizeGround', [
+		'id_lokalId' => '00000000-0000-0000-0000-000000000021',
+		'kommunekode' => '0810',
+	], 'property');
+	$check(($ground['municipalityLabel'] ?? null) === 'Brønderslev Kommune', 'Ground municipality code receives its bundled label.');
+
+	$floor = $invoke('normalizeFloor', [
+		'id_lokalId' => '00000000-0000-0000-0000-000000000022',
+		'eta025Etagetype' => '0',
+	], 'property');
+	$check(($floor['typeLabel'] ?? null) === 'Ikke tagetage', 'Floor type receives its bundled label.');
+
+	$entrance = $invoke('normalizeEntrance', [
+		'id_lokalId' => '00000000-0000-0000-0000-000000000023',
+		'opg020Elevator' => '0',
+		'opg021HusnummerFunktion' => '0',
+	], 'property');
+	$check(($entrance['elevatorLabel'] ?? null) === 'Der er ikke elevator i opgangen', 'Entrance elevator receives its bundled label.');
+	$check(($entrance['houseNumberFunctionLabel'] ?? null) === 'Fastsat til denne', 'Entrance house-number role receives its bundled label.');
 
 	\fwrite(
 		STDOUT,
