@@ -67,6 +67,59 @@ The internal Datafordeler client reuses the shared CitOmni `curl` service and ma
 request, while URLs exposed through Curl metadata, logs, and exceptions are redacted.
 Raw transport metadata is not returned by the public CVR service.
 
+## BBR property lookup
+
+The provider exposes `bbr` for current property data from BBR/DAR through Datafordeler.
+The service is BFE-centered internally and supports all three BBR property types:
+
+- samlet fast ejendom (SFE)
+- bygning på fremmed grund (BPFG)
+- ejerlejlighed
+
+Resolve human-entered auction-style addresses separately from loading the property:
+
+```php
+$resolution = $this->app->bbr->resolveAddress('Nørmarkvej 29, 2 22, 7600 Struer');
+
+if ($resolution['selectedBfeNumber'] !== null) {
+	$property = $this->app->bbr->getPropertyByBfe($resolution['selectedBfeNumber']);
+}
+```
+
+`resolveAddress()` preserves trailing `m.fl.` as `multiplePropertiesHint=true` and returns
+`primary_resolved_scope_incomplete` when the named primary property resolves but the source
+explicitly indicates additional auction properties. The service never invents those additional
+BFE numbers from the primary address.
+
+Owner-apartment resolution uses the concrete DAR floor/door address and the corresponding BBR
+unit/property relation. This allows the selected owner apartment to be distinguished from the
+underlying SFE at the same house number.
+
+Current property data is loaded explicitly by BFE:
+
+```php
+$property = $this->app->bbr->getPropertyByBfe('4268969');
+```
+
+The normalized property graph includes relevant addresses, house numbers, grounds, buildings,
+units, floors, entrances, and technical installations. Each physical BBR object includes a
+`scope` value so context objects such as an owner apartment's host building or a BPFG property's
+underlying ground are not presented as directly belonging to the requested property.
+
+Technical-installation history is opt-in:
+
+```php
+$history = $this->app->bbr->getTechnicalInstallationHistory('4268969');
+```
+
+This keeps normal current-state lookups cheaper while still allowing due-diligence workflows to
+inspect historical BBR technical installations such as former tanks.
+
+Address parsing and deterministic fuzzy-street matching have a local smoke test:
+
+```bash
+php tests/bbr_address_parser_test.php
+```
 ## CVR company lookup
 
 The public CVR service intentionally returns a normalized package-owned array
@@ -192,6 +245,7 @@ OAuth and access-restricted datasets are deliberately outside the initial scope.
 
 The provider keeps the boundaries intentionally small:
 
+- `Service\Bbr` resolves DAR addresses and returns normalized BBR property data.
 - `Service\Cvr` is the public CVR capability and owns CVR-specific queries and normalization.
 - `Service\VatRegistration` is the public VAT-registration status capability.
 - `Support\DatafordelerClient` owns Datafordeler authentication, GraphQL transport, response validation, and safe exception translation.
@@ -207,6 +261,7 @@ artificial generic abstraction.
 
 The provider contributes two shared service IDs:
 
+- `bbr`
 - `cvr`
 - `vatRegistration`
 

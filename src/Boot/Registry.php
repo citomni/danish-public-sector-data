@@ -51,6 +51,7 @@ final class Registry {
 	 * @var array<string, class-string|array{class: class-string, options?: array<array-key, mixed>}>
 	 */
 	public const array MAP_COMMON = [
+		'bbr' => \CitOmni\DanishPublicSectorData\Service\Bbr::class,
 		'cvr' => \CitOmni\DanishPublicSectorData\Service\Cvr::class,
 		'vatRegistration' => \CitOmni\DanishPublicSectorData\Service\VatRegistration::class,
 	];
@@ -96,6 +97,12 @@ final class Registry {
 				'search_url' => 'https://ntse.skat.dk/ntse-front/public/momsnummer/soeg',
 				'timeout' => 15,
 				'connect_timeout' => 5,
+			],
+			'bbr' => [
+				'current_service' => 'flexibleCurrent',
+				'current_version' => 'v3',
+				'history_service' => 'BBR',
+				'history_version' => 'v3',
 			],
 			'cvr' => [
 				'service' => 'flexibleCurrent',
