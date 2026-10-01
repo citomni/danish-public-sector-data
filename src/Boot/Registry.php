@@ -52,6 +52,7 @@ final class Registry {
 	 */
 	public const array MAP_COMMON = [
 		'bbr' => \CitOmni\DanishPublicSectorData\Service\Bbr::class,
+		'soilContamination' => \CitOmni\DanishPublicSectorData\Service\SoilContamination::class,
 		'cvr' => \CitOmni\DanishPublicSectorData\Service\Cvr::class,
 		'vatRegistration' => \CitOmni\DanishPublicSectorData\Service\VatRegistration::class,
 	];
@@ -93,6 +94,11 @@ final class Registry {
 				'timeout' => 15,
 				'connect_timeout' => 5,
 			],
+			'dkjord_wfs' => [
+				'base_url' => 'https://jord.miljoeportal.dk/geo/wfs',
+				'timeout' => 15,
+				'connect_timeout' => 5,
+			],
 			'skat_vat_web' => [
 				'search_url' => 'https://ntse.skat.dk/ntse-front/public/momsnummer/soeg',
 				'timeout' => 15,
@@ -103,6 +109,10 @@ final class Registry {
 				'current_version' => 'v3',
 				'history_service' => 'BBR',
 				'history_version' => 'v3',
+			],
+			'soil_contamination' => [
+				'matrikel_service' => 'flexibleCurrent',
+				'matrikel_version' => 'v3',
 			],
 			'cvr' => [
 				'service' => 'flexibleCurrent',

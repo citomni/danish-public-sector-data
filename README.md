@@ -12,8 +12,7 @@ Repository: https://github.com/citomni/danish-public-sector-data
 It exposes small, normalized CitOmni services while keeping upstream API protocols,
 authentication details, and source-specific data models inside the provider.
 
-The initial implementation supports non-access-restricted company data from the
-Danish Central Business Register (CVR) through Datafordeler GraphQL.
+The provider currently exposes normalized CVR, BBR, VAT-registration, and soil-contamination capabilities backed by the relevant Danish public-sector sources.
 
 ## Requirements
 
@@ -22,7 +21,7 @@ Danish Central Business Register (CVR) through Datafordeler GraphQL.
 - `citomni/kernel`
 - `citomni/infrastructure`
 - An enabled `CitOmni\Infrastructure\Boot\Registry` in the host app
-- A Datafordeler IT-system with an API key for non-access-restricted data
+- A Datafordeler IT-system with an API key for non-access-restricted data when using Datafordeler-backed lookups
 
 ## Install
 
@@ -125,6 +124,43 @@ Address parsing and deterministic fuzzy-street matching have a local smoke test:
 ```bash
 php tests/bbr_address_parser_test.php
 ```
+
+## Soil contamination lookup
+
+The provider exposes `soilContamination` for structured soil-contamination classifications from DKjord. Parcel lookup uses Danmarks Miljøportal's anonymous WFS endpoint; BFE-centered lookup additionally uses Datafordeleren's current Matriklen data to resolve the physical cadastral parcels belonging to the property.
+
+Lookup one exact cadastral parcel by official ejerlav code and matrikelnummer:
+
+```php
+$parcel = $this->app->soilContamination->getByParcel(2005352, '311a');
+```
+
+The result always describes the requested parcel after a successful WFS lookup. `hasDkJordMatch=false` and an empty `classifications` list mean that none of the configured DKjord classification layers matched that exact ejerlav/matrikel pair; this must not be reworded as proof that the soil is uncontaminated.
+
+The initial WFS contract classifies exact parcel matches through these public DKjord layers:
+
+- `localized` from `DKJord:View_LokaliseretFlader`
+- `v1` from `DKJord:View_V1Flader`
+- `v2` from `DKJord:View_V2Flader`
+- `removed_after_mapping` from `DKJord:View_UEKFlader`
+- `removed_before_mapping` from `DKJord:View_UIKFlader`
+
+Matching is exact inside DKjord's semicolon-separated `Lokalitetsmatrikler` field. The service deliberately derives classification from layer membership rather than legacy Parcel API status codes or locality-level descriptive status text. Geometry is not requested.
+
+For property workflows, resolve the physical parcel scope from a BFE number:
+
+```php
+$result = $this->app->soilContamination->getByBfe(3208712);
+```
+
+The BFE lookup supports SFE, building-on-foreign-ground, and owner-apartment properties when an underlying SFE exists. It loads current Matriklen parcels, resolves their official ejerlav identifiers, attaches a normalized `contamination` result to every parcel, and returns a property-level union of matching classifications. A property without an underlying SFE can return `parcelResolutionStatus=no_underlying_sfe` without inventing a parcel association.
+
+The local normalization/query-contract test does not make network requests:
+
+```bash
+php tests/soil_contamination_test.php
+```
+
 ## CVR company lookup
 
 The public CVR service intentionally returns a normalized package-owned array
@@ -251,9 +287,11 @@ OAuth and access-restricted datasets are deliberately outside the initial scope.
 The provider keeps the boundaries intentionally small:
 
 - `Service\Bbr` resolves DAR addresses and returns normalized BBR property data.
+- `Service\SoilContamination` resolves physical Matriklen parcels and returns normalized DKjord soil-contamination data.
 - `Service\Cvr` is the public CVR capability and owns CVR-specific queries and normalization.
 - `Service\VatRegistration` is the public VAT-registration status capability.
 - `Support\DatafordelerClient` owns Datafordeler authentication, GraphQL transport, response validation, and safe exception translation.
+- `Support\DkJordWfsClient` isolates anonymous DKjord WFS transport and GeoJSON response validation.
 - `Support\SkatVatWebClient` isolates the temporary public SKAT web-flow transport details.
 - `Exception` contains transport-agnostic integration failure semantics.
 - No SQL, HTTP controller behavior, or CLI output belongs in these services.
@@ -264,9 +302,10 @@ artificial generic abstraction.
 
 ## Configuration and services
 
-The provider contributes two shared service IDs:
+The provider contributes these shared service IDs:
 
 - `bbr`
+- `soilContamination`
 - `cvr`
 - `vatRegistration`
 

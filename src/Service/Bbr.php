@@ -18,6 +18,7 @@ namespace CitOmni\DanishPublicSectorData\Service;
 use CitOmni\DanishPublicSectorData\Exception\InvalidResponseException;
 use CitOmni\DanishPublicSectorData\Support\DatafordelerClient;
 use CitOmni\DanishPublicSectorData\Util\BbrCodeLists;
+use CitOmni\DanishPublicSectorData\Util\BbrFieldCatalog;
 use CitOmni\Kernel\Service\BaseService;
 
 /**
@@ -329,12 +330,42 @@ final class Bbr extends BaseService {
 
 		$houseNumbers = $this->loadHouseNumbers($graph, $effectiveAt);
 		$addresses = $this->loadUnitAddresses($graph['units'], $effectiveAt);
+		$buildings = \array_values($graph['buildings']);
+		$technicalInstallations = \array_values(
+			\array_filter(
+				$graph['technicalInstallations'],
+				static function(array $installation): bool {
+					$statusCode = $installation['statusCode'] ?? null;
+
+					// Historical and error-registered lifecycle rows belong in history, not the current snapshot.
+					return $statusCode !== '10' && $statusCode !== '11';
+				}
+			)
+		);
+
+		\usort(
+			$buildings,
+			static fn(array $a, array $b): int =>
+				($a['buildingNumber'] ?? \PHP_INT_MAX) <=> ($b['buildingNumber'] ?? \PHP_INT_MAX)
+				?: (($a['id'] ?? '') <=> ($b['id'] ?? ''))
+		);
+		\usort(
+			$technicalInstallations,
+			static fn(array $a, array $b): int =>
+				($a['installationNumber'] ?? \PHP_INT_MAX) <=> ($b['installationNumber'] ?? \PHP_INT_MAX)
+				?: (($a['id'] ?? '') <=> ($b['id'] ?? ''))
+		);
 
 		return [
 			'bfeNumber' => $bfe,
 			'propertyRelationId' => $propertyId,
 			'propertyType' => $kind,
 			'codeListSnapshotDate' => BbrCodeLists::SNAPSHOT_DATE,
+			'codeListSources' => [
+				'primarySnapshotDate' => BbrCodeLists::SNAPSHOT_DATE,
+				'verifiedSourceCheckDate' => BbrCodeLists::VERIFIED_SOURCE_CHECK_DATE,
+				'supplementCoverageDate' => BbrCodeLists::SUPPLEMENT_COVERAGE_DATE,
+			],
 			'statusCode' => self::nullableString($property['status'] ?? null),
 			'statusLabel' => self::codeLabel('Livscyklus', $property['status'] ?? null),
 			'ownerTypeCode' => self::nullableString($property['ejendommensEjerforholdskode'] ?? null),
@@ -346,11 +377,11 @@ final class Bbr extends BaseService {
 			'addresses' => $addresses,
 			'houseNumbers' => $houseNumbers,
 			'grounds' => \array_values($graph['grounds']),
-			'buildings' => \array_values($graph['buildings']),
+			'buildings' => $buildings,
 			'units' => \array_values($graph['units']),
 			'floors' => \array_values($graph['floors']),
 			'entrances' => \array_values($graph['entrances']),
-			'technicalInstallations' => \array_values($graph['technicalInstallations']),
+			'technicalInstallations' => $technicalInstallations,
 		];
 	}
 
@@ -476,9 +507,10 @@ final class Bbr extends BaseService {
 		\usort(
 			$history,
 			static fn(array $a, array $b): int =>
-				($a['id'] <=> $b['id'])
+				($a['installationNumber'] ?? \PHP_INT_MAX) <=> ($b['installationNumber'] ?? \PHP_INT_MAX)
 				?: (($a['validFrom'] ?? '') <=> ($b['validFrom'] ?? ''))
 				?: (($a['registeredFrom'] ?? '') <=> ($b['registeredFrom'] ?? ''))
+				?: ($a['id'] <=> $b['id'])
 		);
 
 		return \array_values($history);
@@ -1778,6 +1810,30 @@ final class Bbr extends BaseService {
 	}
 
 	/**
+	 * Normalize common BBR provenance metadata.
+	 *
+	 * @param array<string,mixed> $node Raw GraphQL node.
+	 * @return array<string,string> Non-empty source metadata.
+	 */
+	private static function normalizeSourceMetadata(array $node): array {
+		$metadata = [
+			'businessEventCode' => self::nullableString($node['forretningshaendelse'] ?? null),
+			'businessEventLabel' => self::codeLabel('ForretningsHaendelse', $node['forretningshaendelse'] ?? null),
+			'businessAreaCode' => self::nullableString($node['forretningsomraade'] ?? null),
+			'businessAreaLabel' => self::codeLabel('ForretningsOmraade', $node['forretningsomraade'] ?? null),
+			'businessProcessCode' => self::nullableString($node['forretningsproces'] ?? null),
+			'businessProcessLabel' => self::codeLabel('ForretningsProcess', $node['forretningsproces'] ?? null),
+			'registrationActor' => self::nullableString($node['registreringsaktoer'] ?? null),
+			'effectActor' => self::nullableString($node['virkningsaktoer'] ?? null),
+		];
+
+		return \array_filter(
+			$metadata,
+			static fn(?string $value): bool => $value !== null && $value !== ''
+		);
+	}
+
+	/**
 	 * Normalize one ground.
 	 */
 	private function normalizeGround(array $node, string $scope): array {
@@ -1800,6 +1856,9 @@ final class Bbr extends BaseService {
 			'wastewaterMembershipLabel' => self::codeLabel('MedlemsskabAfSplidevandforsyning', $node['gru022MedlemskabAfSpildevandsforsyning'] ?? null),
 			'wastewaterOrderCode' => self::nullableString($node['gru023PaabudVedrSpildevandsafledning'] ?? null),
 			'wastewaterOrderLabel' => self::codeLabel('Rensningspaabud', $node['gru023PaabudVedrSpildevandsafledning'] ?? null),
+			'wastewaterOrderDeadline' => self::nullableString($node['gru024FristVedrSpildevandsafledning'] ?? null),
+			'sourceMetadata' => self::normalizeSourceMetadata($node),
+			'additionalFields' => BbrFieldCatalog::normalizeAdditionalFields('ground', $node),
 			'registeredFrom' => self::nullableString($node['registreringFra'] ?? null),
 			'registeredTo' => self::nullableString($node['registreringTil'] ?? null),
 			'validFrom' => self::nullableString($node['virkningFra'] ?? null),
@@ -1820,6 +1879,8 @@ final class Bbr extends BaseService {
 			'groundId' => self::nullableString($node['grund'] ?? null),
 			'landParcelId' => self::nullableString($node['jordstykke'] ?? null),
 			'ownerApartmentPropertyRelationId' => self::nullableString($node['ejerlejlighed'] ?? null),
+			'municipalityCode' => self::nullableString($node['kommunekode'] ?? null),
+			'municipalityLabel' => self::codeLabel('Kommunekode', $node['kommunekode'] ?? null),
 			'buildingNumber' => self::nullableInt($node['byg007Bygningsnummer'] ?? null),
 			'applicationCode' => self::nullableString($node['byg021BygningensAnvendelse'] ?? null),
 			'applicationLabel' => self::codeLabel('BygAnvendelse', $node['byg021BygningensAnvendelse'] ?? null),
@@ -1831,6 +1892,13 @@ final class Bbr extends BaseService {
 			'waterSupplyLabel' => self::codeLabel('Vandforsyning', $node['byg030Vandforsyning'] ?? null),
 			'drainageCode' => self::nullableString($node['byg031Afloebsforhold'] ?? null),
 			'drainageLabel' => self::codeLabel('Afloebsforhold', $node['byg031Afloebsforhold'] ?? null),
+			'dischargePermitCode' => self::nullableString($node['byg119Udledningstilladelse'] ?? null),
+			'dischargePermitLabel' => self::codeLabel('Udledningstilladelse', $node['byg119Udledningstilladelse'] ?? null),
+			'wastewaterMembershipCode' => self::nullableString($node['byg123MedlemskabAfSpildevandsforsyning'] ?? null),
+			'wastewaterMembershipLabel' => self::codeLabel('MedlemsskabAfSplidevandforsyning', $node['byg123MedlemskabAfSpildevandsforsyning'] ?? null),
+			'wastewaterOrderCode' => self::nullableString($node['byg124PaabudVedrSpildevandsafledning'] ?? null),
+			'wastewaterOrderLabel' => self::codeLabel('Rensningspaabud', $node['byg124PaabudVedrSpildevandsafledning'] ?? null),
+			'wastewaterOrderDeadline' => self::nullableString($node['byg125FristVedrSpildevandsafledning'] ?? null),
 			'outerWallMaterialCode' => self::nullableString($node['byg032YdervaeggensMateriale'] ?? null),
 			'outerWallMaterialLabel' => self::codeLabel('YdervaeggenesMateriale', $node['byg032YdervaeggensMateriale'] ?? null),
 			'roofMaterialCode' => self::nullableString($node['byg033Tagdaekningsmateriale'] ?? null),
@@ -1865,6 +1933,8 @@ final class Bbr extends BaseService {
 			'preservationLabel' => self::codeLabel('Fredning', $node['byg070Fredning'] ?? null),
 			'preservationReference' => self::nullableString($node['byg071BevaringsvaerdighedReference'] ?? null),
 			'notes' => self::nullableString($node['byg500Notatlinjer'] ?? null),
+			'sourceMetadata' => self::normalizeSourceMetadata($node),
+			'additionalFields' => BbrFieldCatalog::normalizeAdditionalFields('building', $node),
 			'registeredFrom' => self::nullableString($node['registreringFra'] ?? null),
 			'registeredTo' => self::nullableString($node['registreringTil'] ?? null),
 			'validFrom' => self::nullableString($node['virkningFra'] ?? null),
@@ -1885,6 +1955,8 @@ final class Bbr extends BaseService {
 			'buildingId' => self::nullableString($node['bygning'] ?? null),
 			'floorId' => self::nullableString($node['etage'] ?? null),
 			'entranceId' => self::nullableString($node['opgang'] ?? null),
+			'municipalityCode' => self::nullableString($node['kommunekode'] ?? null),
+			'municipalityLabel' => self::codeLabel('Kommunekode', $node['kommunekode'] ?? null),
 			'applicationCode' => self::nullableString($node['enh020EnhedensAnvendelse'] ?? null),
 			'applicationLabel' => self::codeLabel('EnhAnvendelse', $node['enh020EnhedensAnvendelse'] ?? null),
 			'housingTypeCode' => self::nullableString($node['enh023Boligtype'] ?? null),
@@ -1893,6 +1965,8 @@ final class Bbr extends BaseService {
 			'residentialArea' => self::nullableInt($node['enh027ArealTilBeboelse'] ?? null),
 			'businessArea' => self::nullableInt($node['enh028ArealTilErhverv'] ?? null),
 			'roomCount' => self::nullableInt($node['enh031AntalVaerelser'] ?? null),
+			'flushToiletCount' => self::nullableInt($node['enh065AntalVandskylledeToiletter'] ?? null),
+			'bathroomCount' => self::nullableInt($node['enh066AntalBadevaerelser'] ?? null),
 			'toiletCode' => self::nullableString($node['enh032Toiletforhold'] ?? null),
 			'toiletLabel' => self::codeLabel('Toiletforhold', $node['enh032Toiletforhold'] ?? null),
 			'bathCode' => self::nullableString($node['enh033Badeforhold'] ?? null),
@@ -1909,6 +1983,8 @@ final class Bbr extends BaseService {
 			'heatingMediumLabel' => self::codeLabel('Opvarmningsmiddel', $node['enh052Opvarmningsmiddel'] ?? null),
 			'supplementaryHeatingCode' => self::nullableString($node['enh053SupplerendeVarme'] ?? null),
 			'supplementaryHeatingLabel' => self::codeLabel('SupplerendeVarme', $node['enh053SupplerendeVarme'] ?? null),
+			'sourceMetadata' => self::normalizeSourceMetadata($node),
+			'additionalFields' => BbrFieldCatalog::normalizeAdditionalFields('unit', $node),
 			'registeredFrom' => self::nullableString($node['registreringFra'] ?? null),
 			'registeredTo' => self::nullableString($node['registreringTil'] ?? null),
 			'validFrom' => self::nullableString($node['virkningFra'] ?? null),
@@ -1926,6 +2002,8 @@ final class Bbr extends BaseService {
 			'statusCode' => self::nullableString($node['status'] ?? null),
 			'statusLabel' => self::codeLabel('Livscyklus', $node['status'] ?? null),
 			'buildingId' => self::nullableString($node['bygning'] ?? null),
+			'municipalityCode' => self::nullableString($node['kommunekode'] ?? null),
+			'municipalityLabel' => self::codeLabel('Kommunekode', $node['kommunekode'] ?? null),
 			'label' => self::nullableString($node['eta006BygningensEtagebetegnelse'] ?? null),
 			'totalArea' => self::nullableInt($node['eta020SamletArealAfEtage'] ?? null),
 			'usedAtticArea' => self::nullableInt($node['eta021ArealAfUdnyttetDelAfTagetage'] ?? null),
@@ -1933,6 +2011,8 @@ final class Bbr extends BaseService {
 			'legalBasementResidentialArea' => self::nullableInt($node['eta023ArealAfLovligBeboelseIKaelder'] ?? null),
 			'typeCode' => self::nullableString($node['eta025Etagetype'] ?? null),
 			'typeLabel' => self::codeLabel('EtageType', $node['eta025Etagetype'] ?? null),
+			'sourceMetadata' => self::normalizeSourceMetadata($node),
+			'additionalFields' => BbrFieldCatalog::normalizeAdditionalFields('floor', $node),
 			'registeredFrom' => self::nullableString($node['registreringFra'] ?? null),
 			'registeredTo' => self::nullableString($node['registreringTil'] ?? null),
 			'validFrom' => self::nullableString($node['virkningFra'] ?? null),
@@ -1951,10 +2031,14 @@ final class Bbr extends BaseService {
 			'statusLabel' => self::codeLabel('Livscyklus', $node['status'] ?? null),
 			'buildingId' => self::nullableString($node['bygning'] ?? null),
 			'houseNumberId' => self::nullableString($node['adgangFraHusnummer'] ?? null),
+			'municipalityCode' => self::nullableString($node['kommunekode'] ?? null),
+			'municipalityLabel' => self::codeLabel('Kommunekode', $node['kommunekode'] ?? null),
 			'elevatorCode' => self::nullableString($node['opg020Elevator'] ?? null),
 			'elevatorLabel' => self::codeLabel('Elevator', $node['opg020Elevator'] ?? null),
 			'houseNumberFunctionCode' => self::nullableString($node['opg021HusnummerFunktion'] ?? null),
 			'houseNumberFunctionLabel' => self::codeLabel('HusnummerRolle', $node['opg021HusnummerFunktion'] ?? null),
+			'sourceMetadata' => self::normalizeSourceMetadata($node),
+			'additionalFields' => BbrFieldCatalog::normalizeAdditionalFields('entrance', $node),
 			'registeredFrom' => self::nullableString($node['registreringFra'] ?? null),
 			'registeredTo' => self::nullableString($node['registreringTil'] ?? null),
 			'validFrom' => self::nullableString($node['virkningFra'] ?? null),
@@ -1980,6 +2064,8 @@ final class Bbr extends BaseService {
 			'landParcelId' => self::nullableString($node['jordstykke'] ?? null),
 			'buildingOnForeignGroundPropertyRelationId' => self::nullableString($node['bygningPaaFremmedGrund'] ?? null),
 			'ownerApartmentPropertyRelationId' => self::nullableString($node['ejerlejlighed'] ?? null),
+			'municipalityCode' => self::nullableString($node['kommunekode'] ?? null),
+			'municipalityLabel' => self::codeLabel('Kommunekode', $node['kommunekode'] ?? null),
 			'installationNumber' => self::nullableInt($node['tek007Anlaegsnummer'] ?? null),
 			'classificationCode' => self::nullableString($node['tek020Klassifikation'] ?? null),
 			'classificationLabel' => self::codeLabel('Klassifikation', $node['tek020Klassifikation'] ?? null),
@@ -2016,6 +2102,8 @@ final class Bbr extends BaseService {
 					'wkt' => self::nullableString($coordinate['wkt'] ?? null),
 				]
 				: null,
+			'sourceMetadata' => self::normalizeSourceMetadata($node),
+			'additionalFields' => BbrFieldCatalog::normalizeAdditionalFields('technicalInstallation', $node),
 			'registeredFrom' => self::nullableString($node['registreringFra'] ?? null),
 			'registeredTo' => self::nullableString($node['registreringTil'] ?? null),
 			'validFrom' => self::nullableString($node['virkningFra'] ?? null),
@@ -3151,37 +3239,45 @@ GRAPHQL;
 
 	private function groundFields(): string {
 		return <<<'GRAPHQL'
-id_lokalId
-status
 bestemtFastEjendom
-husnummer
-kommunekode
+forretningshaendelse
+forretningsomraade
+forretningsproces
 gru009Vandforsyning
 gru010Afloebsforhold
 gru021Udledningstilladelse
 gru022MedlemskabAfSpildevandsforsyning
 gru023PaabudVedrSpildevandsafledning
+gru024FristVedrSpildevandsafledning
+gru025TilladelseTilUdtraeden
+gru026DatoForTilladelseTilUdtraeden
+gru027TilladelseTilAlternativBortskaffelseEllerAfledning
+gru028DatoForTilladelseTilAlternativBortskaffelseEllerAfledning
+gru029DispensationFritagelseIftKollektivVarmeforsyning
+gru030DatoForDispensationFritagelseIftKollektivVarmeforsyning
+gru500Notatlinjer
+husnummer
+id_lokalId
+kommunekode
 registreringFra
+registreringsaktoer
 registreringTil
+status
 virkningFra
+virkningsaktoer
 virkningTil
 GRAPHQL;
 	}
 
 	private function buildingFields(): string {
 		return <<<'GRAPHQL'
-id_lokalId
-status
-husnummer
-grund
-jordstykke
-ejerlejlighed
 byg007Bygningsnummer
 byg021BygningensAnvendelse
 byg024AntalLejlighederMedKoekken
 byg025AntalLejlighederUdenKoekken
 byg026Opfoerelsesaar
 byg027OmTilbygningsaar
+byg029DatoForMidlertidigOpfoertBygning
 byg030Vandforsyning
 byg031Afloebsforhold
 byg032YdervaeggensMateriale
@@ -3198,98 +3294,217 @@ byg042ArealIndbyggetGarage
 byg043ArealIndbyggetCarport
 byg044ArealIndbyggetUdhus
 byg045ArealIndbyggetUdestueEllerLign
+byg046SamletArealAfLukkedeOverdaekningerPaaBygningen
+byg047ArealAfAffaldsrumITerraenniveau
+byg048AndetAreal
 byg049ArealAfOverdaekketAreal
+byg050ArealAabneOverdaekningerPaaBygningenSamlet
+byg051Adgangsareal
+byg052BeregningsprincipCarportAreal
 byg053BygningsarealerKilde
 byg054AntalEtager
+byg055AfvigendeEtager
 byg056Varmeinstallation
 byg057Opvarmningsmiddel
 byg058SupplerendeVarme
+byg069Sikringsrumpladser
 byg070Fredning
 byg071BevaringsvaerdighedReference
+byg094Revisionsdato
+byg111StormraadetsOversvoemmelsesSelvrisiko
+byg112DatoForRegistreringFraStormraadet
+byg113Byggeskadeforsikringsselskab
+byg114DatoForByggeskadeforsikring
+byg119Udledningstilladelse
+byg121OmfattetAfByggeskadeforsikring
+byg122Gyldighedsdato
+byg123MedlemskabAfSpildevandsforsyning
+byg124PaabudVedrSpildevandsafledning
+byg125FristVedrSpildevandsafledning
+byg126TilladelseTilUdtraeden
+byg127DatoForTilladelseTilUdtraeden
+byg128TilladelseTilAlternativBortskaffelseEllerAfledning
+byg129DatoForTilladelseTilAlternativBortskaffelseEllerAfledning
+byg130ArealAfUdvendigEfterisolering
+byg131DispensationFritagelseIftKollektivVarmeforsyning
+byg132DatoForDispensationFritagelseIftKollektivVarmeforsyning
+byg133KildeTilKoordinatsaet
+byg134KvalitetAfKoordinatsaet
+byg135SupplerendeOplysningOmKoordinatsaet
+byg136PlaceringPaaSoeterritorie
+byg137BanedanmarkBygvaerksnummer
+byg140ServitutForUdlejningsEjendomDato
+byg150Gulvbelaegning
+byg151Frihoejde
+byg152AabenLukketKonstruktion
+byg153Konstruktionsforhold
+byg301TypeAfFlytning
+byg302Tilflytterkommune
+byg403OevrigeBemaerkningerFraStormraadet
+byg404Koordinat {
+	crs
+	wkt
+}
+byg406Koordinatsystem
 byg500Notatlinjer
+ejerlejlighed
+forretningshaendelse
+forretningsomraade
+forretningsproces
+grund
+husnummer
+id_lokalId
+jordstykke
+kommunekode
 registreringFra
+registreringsaktoer
 registreringTil
+status
 virkningFra
+virkningsaktoer
 virkningTil
 GRAPHQL;
 	}
 
 	private function unitFields(): string {
 		return <<<'GRAPHQL'
-id_lokalId
-status
 adresseIdentificerer
 bygning
-etage
-opgang
+enh008UUIDTilModerlejlighed
 enh020EnhedensAnvendelse
 enh023Boligtype
+enh024KondemneretBoligenhed
+enh025OprettelsesdatoForEnhedensIdentifikation
 enh026EnhedensSamledeAreal
 enh027ArealTilBeboelse
 enh028ArealTilErhverv
+enh030KildeTilEnhedensArealer
 enh031AntalVaerelser
 enh032Toiletforhold
 enh033Badeforhold
 enh034Koekkenforhold
 enh035Energiforsyning
+enh039AndetAreal
+enh041LovligAnvendelse
+enh042DatoForTidsbegraensetDispensation
+enh044DatoForDelvisIbrugtagningsTilladelse
 enh045Udlejningsforhold
+enh046OffentligStoette
+enh047IndflytningDato
+enh048GodkendtTomBolig
 enh051Varmeinstallation
 enh052Opvarmningsmiddel
 enh053SupplerendeVarme
+enh060EnhedensAndelFaellesAdgangsareal
+enh061ArealAfAabenOverdaekning
+enh062ArealAfLukketOverdaekningUdestue
+enh063AntalVaerelserTilErhverv
+enh065AntalVandskylledeToiletter
+enh066AntalBadevaerelser
+enh067Stoejisolering
+enh068FlexboligTilladelsesart
+enh069FlexboligOphoersdato
+enh070AabenAltanTagterrasseAreal
+enh071AdresseFunktion
+enh101Gyldighedsdato
+enh102HerafAreal1
+enh103HerafAreal2
+enh104HerafAreal3
+enh105SupplerendeAnvendelseskode1
+enh106SupplerendeAnvendelseskode2
+enh107SupplerendeAnvendelseskode3
+enh127FysiskArealTilBeboelse
+enh128FysiskArealTilErhverv
+enh500Notatlinjer
+etage
+forretningshaendelse
+forretningsomraade
+forretningsproces
+id_lokalId
+kommunekode
+opgang
 registreringFra
+registreringsaktoer
 registreringTil
+status
 virkningFra
+virkningsaktoer
 virkningTil
 GRAPHQL;
 	}
 
 	private function floorFields(): string {
 		return <<<'GRAPHQL'
-id_lokalId
-status
 bygning
 eta006BygningensEtagebetegnelse
 eta020SamletArealAfEtage
 eta021ArealAfUdnyttetDelAfTagetage
 eta022Kaelderareal
 eta023ArealAfLovligBeboelseIKaelder
+eta024EtagensAdgangsareal
 eta025Etagetype
+eta026ErhvervIKaelder
+eta500Notatlinjer
+forretningshaendelse
+forretningsomraade
+forretningsproces
+id_lokalId
+kommunekode
 registreringFra
+registreringsaktoer
 registreringTil
+status
 virkningFra
+virkningsaktoer
 virkningTil
 GRAPHQL;
 	}
 
 	private function entranceFields(): string {
 		return <<<'GRAPHQL'
-id_lokalId
-status
-bygning
 adgangFraHusnummer
+bygning
+forretningshaendelse
+forretningsomraade
+forretningsproces
+id_lokalId
+kommunekode
 opg020Elevator
 opg021HusnummerFunktion
+opg500Notatlinjer
 registreringFra
+registreringsaktoer
 registreringTil
+status
 virkningFra
+virkningsaktoer
 virkningTil
 GRAPHQL;
 	}
 
 	private function technicalFields(): string {
 		return <<<'GRAPHQL'
-id_lokalId
-status
-husnummer
 bygning
-grund
-enhed
-jordstykke
 bygningPaaFremmedGrund
 ejerlejlighed
+enhed
+forretningshaendelse
+forretningsomraade
+forretningsproces
+grund
+husnummer
+id_lokalId
+jordstykke
+kommunekode
+registreringFra
+registreringsaktoer
+registreringTil
+status
 tek007Anlaegsnummer
 tek020Klassifikation
 tek021FabrikatType
+tek022EksternDatabase
+tek023EksternNoegle
 tek024Etableringsaar
 tek025TilOmbygningsaar
 tek026StoerrelsesklasseOlietank
@@ -3302,20 +3517,40 @@ tek033Type
 tek034IndholdOlietank
 tek035SloejfningsfristOlietank
 tek036Rumfang
+tek037Areal
+tek038Hoejde
+tek039Effekt
+tek040Fredning
+tek042Revisionsdato
+tek045Koordinatsystem
 tek067Fabrikationsaar
 tek068Materiale
+tek069SupplerendeIndvendigKorrosionsbeskyttelse
+tek070DatoForSenestUdfoerteSupplerendeIndvendigKorrosionsbeskyttelse
 tek072Sloejfningsaar
+tek073Navhoejde
+tek074Vindmoellenummer
+tek075Rotordiameter
+tek076KildeTilKoordinatsaet
+tek077KvalitetAfKoordinatsaet
+tek078SupplerendeOplysningOmKoordinatsaet
+tek101Gyldighedsdato
+tek102FabrikatVindmoelle
+tek103FabrikatOliefyr
+tek104FabrikatSolcelleanlaegSolvarme
 tek105OverdaekningTank
 tek106InspektionsdatoTank
+tek107PlaceringPaaSoeterritorie
 tek109Koordinat {
 	crs
 	wkt
 }
 tek110Driftstatus
 tek111DatoForSenesteInspektion
-registreringFra
-registreringTil
+tek112InspicerendeVirksomhed
+tek500Notatlinjer
 virkningFra
+virkningsaktoer
 virkningTil
 GRAPHQL;
 	}

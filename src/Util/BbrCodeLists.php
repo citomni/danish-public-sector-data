@@ -16,17 +16,20 @@ declare(strict_types=1);
 namespace CitOmni\DanishPublicSectorData\Util;
 
 /**
- * BbrCodeLists: Resolve labels from a versioned snapshot of official BBR code lists.
+ * BbrCodeLists: Resolve labels from bundled official BBR code-list snapshots.
  *
  * Behavior:
- * - Maps selected BBR code-list names and code values to their official Danish labels.
+ * - Resolves labels from the primary BBR Teknik snapshot captured on 2026-09-30.
+ * - Adds code lists individually verified against BBR Teknik on 2026-10-01 when they are absent from the primary snapshot.
+ * - Supplements remaining missing list/code pairs from the official KDS export covering the exposed code lists as of 2026-02-24.
+ * - Keeps the primary snapshot authoritative when multiple bundled sources could describe the same list/code pair.
  * - Returns null for unknown list names or code values so callers can preserve safe code fallbacks.
  *
  * Notes:
- * - The snapshot was captured from the official BBR Teknik code-list publication on 2026-09-30.
- * - The snapshot is bundled to avoid runtime scraping and extra HTTP requests during property lookup.
- * - Codes remain authoritative in normalized BBR results; labels are additive snapshot metadata.
- * - Update this snapshot deliberately when official BBR code lists change.
+ * - Verified and supplemental arrays are additive by construction and never replace an existing primary label.
+ * - The static arrays avoid runtime CSV parsing, scraping, merging or extra HTTP requests.
+ * - Codes remain authoritative in normalized BBR results; labels are additive source metadata.
+ * - SNAPSHOT_DATE, VERIFIED_SOURCE_CHECK_DATE and SUPPLEMENT_COVERAGE_DATE describe different provenance dates.
  *
  * Typical usage:
  *   $label = BbrCodeLists::label('Tagdaekningsmateriale', '5');
@@ -34,6 +37,8 @@ namespace CitOmni\DanishPublicSectorData\Util;
 final class BbrCodeLists {
 
 	public const string SNAPSHOT_DATE = '2026-09-30';
+	public const string VERIFIED_SOURCE_CHECK_DATE = '2026-10-01';
+	public const string SUPPLEMENT_COVERAGE_DATE = '2026-02-24';
 
 	/** @var array<string,array<string,string>> */
 	private const array LISTS = [
@@ -94,6 +99,19 @@ final class BbrCodeLists {
 			'590' => 'Øvrige renseløsninger: Andet',
 			'601' => 'Anden type afløb (større end 30 PE med egen udledning)',
 			'701' => 'Intet afløb',
+		],
+		'MedlemsskabAfSplidevandforsyning' => [
+			'0' => 'Ikke oplyst',
+			'1' => 'Ikke medlemskab af spildevandsforsyning',
+			'2' => 'Medlemskab af spildevandsforsyning',
+		],
+		'Rensningspaabud' => [
+			'0' => 'Ikke oplyst',
+			'1' => 'Rensning ok. Intet påbud',
+			'2' => 'Rensning skal forbedres til SOP',
+			'3' => 'Rensning skal forbedres til SO',
+			'4' => 'Rensning skal forbedres til OP',
+			'5' => 'Rensning skal forbedres til O',
 		],
 		'Badeforhold' => [
 			'C' => 'Adgang til badeværelse',
@@ -572,6 +590,7 @@ final class BbrCodeLists {
 		],
 		'Placering' => [
 			'1' => 'Nedgravet',
+			'2' => 'Over terræn, udendørs',
 			'3' => 'Indendørs',
 		],
 		'Sloejfning' => [
@@ -661,7 +680,510 @@ final class BbrCodeLists {
 	];
 
 	/**
-	 * Return the snapshot label for one BBR code.
+	 * Code lists individually verified against BBR Teknik on 2026-10-01.
+	 *
+	 * These lists are absent from both LISTS and the KDS 2026-02-24 export used for
+	 * SUPPLEMENT_LISTS. Keeping them separate preserves source provenance and lookup priority.
+	 *
+	 * @var array<string,array<string,string>>
+	 */
+	private const array VERIFIED_LISTS = [
+		'AdresseRolle' => [
+			'0' => 'Fastsat til denne',
+			'1' => 'Kun vejledende',
+		],
+		'BeregningsprincipForArealAfCarport' => [
+			'1' => 'Carportareal er målt efter tagflade',
+			'2' => 'Carportarealet er målt ½ meter inde på åbne sider',
+		],
+		'Konstruktion' => [
+			'1' => 'Åben konstruktion',
+			'2' => 'Lukket konstruktion',
+		],
+		'Konstruktionsforhold' => [
+			'1' => 'Bygningen har jernbetonskelet',
+			'2' => 'Bygningen har ikke jernbetonskelet',
+		],
+		'Materiale' => [
+			'1' => 'Plast',
+			'2' => 'Stål',
+			'3' => 'Plasttank med udvendig stålvæg',
+		],
+		'TypeAfVaegge' => [
+			'1' => 'Enkeltvægget',
+			'2' => 'Dobbeltvægget',
+			'3' => 'Dobbeltvægget med overvågning',
+			'4' => 'Overjordisk anlæg, hele anlægget er tilgængeligt for udvendig visuel inspektion',
+			'5' => 'Tanke som er installeret før 1970, udvendig korrosionsbeskyttelse med bitumenbelægning',
+		],
+	];
+
+	/**
+	 * Missing list/code pairs from the official KDS BBR code-list export dated 2026-02-24.
+	 *
+	 * The supplement is deliberately additive. No list/code pair in this array exists in LISTS,
+	 * so older source data can never replace a label from the newer primary snapshot.
+	 *
+	 * @var array<string,array<string,string>>
+	 */
+	private const array SUPPLEMENT_LISTS = [
+		'AfvigendeEtager' => [
+			'0' => 'Bygningen har ikke afvigende etager',
+			'10' => 'Bygningen har afvigende etager',
+			'11' => 'Bygningen indeholder hems',
+			'12' => 'Bygningen indeholder etagegennembrydende rum',
+			'13' => 'Bygningen indeholder indskudt etage',
+		],
+		'AsbestholdigtMateriale' => [
+			'1' => 'Asbestholdigt ydervægsmateriale',
+			'2' => 'Asbestholdigt tagdækningsmateriale',
+			'3' => 'Asbestholdigt ydervægs- og tagdækningsmateriale',
+			'4' => 'Øvrige asbestholdige materialer',
+			'5' => 'Ikke asbest i bygningen',
+		],
+		'BBRMessageAarsagskode' => [
+			'1' => 'Denne BBR-meddelelse er hentet via selvbetjening.',
+			'20' => 'Denne BBR-meddelelse er udskrevet på grund af ændringer i ejeroplysningerne i Ejerfortegnelsen. BBR-meddelelsen sendes til alle ejere/administratorer af ejendommen.',
+			'30' => 'Denne BBR-meddelelse er udskrevet på anmodning.',
+			'31' => 'Denne BBR-andelsboligudskrift er udskrevet på anmodning.',
+			'40' => 'Denne BBR-meddelelse er udskrevet på grund af afsluttet byggesag.',
+			'41' => 'Denne BBR-meddelelse er udskrevet på grund af indflytning.',
+			'42' => 'Denne BBR-meddelelse er udskrevet på grund af delvis eller midlertidig afsluttet byggesag.',
+			'45' => 'Denne BBR-meddelelse er udskrevet på grund af ændring uden byggesag.',
+			'46' => 'Denne BBR-meddelelse er udskrevet på grund af opdeling af lejligheder.',
+			'47' => 'Denne BBR-meddelelse er udskrevet på grund af sammenlægning af lejligheder.',
+			'48' => 'Denne BBR-meddelelse er udskrevet på grund af opdeling/ændret opdeling i ejerlejligheder.',
+			'50' => 'Denne BBR-meddelelse er udskrevet på grund af, at kommunen har foretaget rettelser af registreringen i BBR.',
+			'51' => 'Der er et byggeri på ejendommen som ikke er færdigmeldt. Kommunen har nu registreret byggeriet som fuldført. Er byggeriet ikke færdigt, skal du orientere kommunen.',
+			'70' => 'Denne BBR-meddelelse er udskrevet på grund af matrikulære ændringer.',
+			'80' => 'Denne BBR-meddelelse er udskrevet, fordi ejer selv eller andre har rettet, slettet eller tilføjet oplysninger. Kontrollér venligst at ændringerne er korrekte.',
+			'81' => 'Denne BBR-meddelelse er udskrevet fordi skatteforvaltningen har rettet, slettet eller tilføjet oplysninger på ejendommen.',
+			'98' => 'Denne BBR-meddelelse er udskrevet manuelt med brugerdefineret årsagskodetekst',
+		],
+		'BygAfloebsforhold' => [
+			'1' => 'Fælleskloakeret: spildevand + tag- og overfladevand',
+			'10' => 'Afløb til offentligt kloaksystem',
+			'101' => 'SOP: Minirenseanlæg med direkte udledning',
+			'102' => 'SOP: Minirenseanlæg med udledning til markdræn',
+			'103' => 'SOP: Minirenseanlæg med nedsivning i faskine',
+			'104' => 'SOP: Nedsivning til sivedræn',
+			'105' => 'SOP: Samletank',
+			'106' => 'SOP: Pileanlæg med nedsivning (uden membran)',
+			'107' => 'SOP: Pileanlæg uden udledning (med membran)',
+			'108' => 'SOP: Beplantede filteranlæg med nedsivning i faskine',
+			'109' => 'SOP: Sandfiltre med P-fældning i bundfældningstanken og direkte udledning',
+			'11' => 'Afløb til fællesprivat kloaksystem',
+			'110' => 'SOP: Sandfiltre med P-fældning i bundfældningstanken og udledning til markdræn',
+			'12' => 'Afløb til fællesprivat kloaksystem med tilslutning til spildevandsforsyningens kloaksystem',
+			'190' => 'SOP: Andet',
+			'2' => 'Fælleskloakeret: spildevand + delvis tag- og overfladevand',
+			'20' => 'Afløb til samletank',
+			'201' => 'SO: Biologisk sandfilter med direkte udledning',
+			'202' => 'SO: Biologisk sandfilter med udledning til markdræn',
+			'203' => 'SO: Minirensanlæg med direkte udledning',
+			'204' => 'SO: Minirenseanlæg med udledning til markdræn',
+			'205' => 'SO: Beplantede filteranlæg med direkte udledning',
+			'206' => 'SO: Beplantede filteranlæg med udledning til markdræn',
+			'21' => 'Afløb til samletank for toiletvand og mekanisk rensning af øvrigt spildevand',
+			'29' => 'Mekanisk rensning med nedsivningsanlæg med tilladelse',
+			'290' => 'SO: Andet',
+			'3' => 'Fælleskloakeret: spildevand',
+			'30' => 'Mekanisk rensning med nedsivningsanlæg (tilladelse ikke påkrævet)',
+			'301' => 'OP: Minirenseanlæg med direkte udledning',
+			'302' => 'OP: Minirenseanlæg med udledning til markdræn',
+			'31' => 'Mekanisk rensning med privat udledning direkte til vandløb, søer eller havet',
+			'32' => 'Mekanisk og biologisk rensning (ældre anlæg uden renseklasse)',
+			'390' => 'OP: Andet',
+			'4' => 'Fælleskloakeret: tag- og overfladevand',
+			'401' => 'O: Rodzoneanlæg med direkte udledning',
+			'402' => 'O: Rodzoneanlæg med udledning til markdræn',
+			'403' => 'O: Minirenseanlæg med direkte udledning',
+			'404' => 'O: Minirenseanlæg med udledning til markdræn',
+			'490' => 'O: Andet',
+			'5' => 'Separatkloakeret: spildevand + tag- og overfladevand',
+			'501' => 'Øvrige renseløsninger: Mekanisk med direkte udledning',
+			'502' => 'Øvrige renseløsninger: Mekanisk med udledning til markdræn',
+			'503' => 'Øvrige renseløsninger: Ældre nedsivningsanlæg med nedsivning til sivebrønd',
+			'504' => 'Udledning til jordoverfladen',
+			'505' => 'Udledning urenset',
+			'590' => 'Øvrige renseløsninger: Andet',
+			'6' => 'Separatkloakeret: spildevand + delvis tag- og overfladevand',
+			'601' => 'Anden type afløb (større end 30 PE med egen udledning)',
+			'7' => 'Separatkloakeret: spildevand',
+			'70' => 'Udledning uden rensning direkte til vandløb, søer eller havet',
+			'701' => 'Intet afløb',
+			'75' => 'Afløbsforhold er registreret på bygninger',
+			'8' => 'Separatkloakeret: tag- og overfladevand',
+			'80' => 'Anden type afløb',
+			'9' => 'Spildevandskloakeret: Spildevand',
+			'90' => 'Ingen udledning',
+		],
+		'BygDaekningsafgift' => [
+			'0' => 'Ikke omfattet af dækningsafgift',
+			'1' => 'Omfattet af dækningsafgift',
+			'2' => 'Delvist omfattet af dækningsafgift',
+		],
+		'Byggesagskode' => [
+			'1' => 'BR - Tilladelsessag uden ibrugtagningstilladelse',
+			'2' => '(UDFASES) BR - Anmeldelsessag (garager, carporte, udhuse og nedrivning)',
+			'3' => 'BR - Tilladelsessag med ibrugtagningstilladelse',
+			'4' => 'BR - Tilladelsessag landbrugsbygning',
+			'5' => '(UDFASES) BR - Anmeldelsessag (øvrige)',
+			'6' => 'BR – Tilladelsessag Nedrivning',
+			'7' => 'BR – Lovliggørelse',
+		],
+		'Byggeskadeforsikringsselskab' => [
+			'0' => 'Ingen byggeskadeforsikring',
+			'1' => 'Tryg',
+			'10' => 'Købstædernes Forsikring',
+			'100' => 'Byggeskadeforsikring udløbet',
+			'11' => 'ALKA',
+			'12' => 'Frida Forsikring Agentur',
+			'13' => 'NemForsikring',
+			'14' => 'AXA',
+			'15' => 'Husejernes Forsikring',
+			'16' => 'Garbo',
+			'17' => 'Marsh og McLennan Agency A/S',
+			'18' => 'First Marine',
+			'19' => 'Domus Forsikring A/S',
+			'2' => 'Topdanmark',
+			'4' => 'Codan',
+			'5' => 'If Forsikring',
+			'6' => 'Alm. Brand',
+			'7' => 'Danske Forsikring',
+			'8' => 'Caplloyd A/S',
+			'98' => 'Dækket af byggeskadefonden',
+			'99' => 'Ingen forsikring på grund af dispensation',
+		],
+		'BygherreForhold' => [
+			'10' => 'Privatpersoner eller interessentskab',
+			'20' => 'Alment boligselskab',
+			'30' => 'Aktie-, anpart- eller andet selskab (undtagen interessent­skab)',
+			'40' => 'Forening, legat eller selvejende institution',
+			'41' => 'Privat andelsboligforening',
+			'50' => 'Den kommune, hvori ejendommen er beliggende',
+			'60' => 'Anden primærkommune',
+			'70' => 'Region',
+			'80' => 'Staten',
+			'90' => 'Andet, herunder moderejendomme for bebyggelser, der er op­delt i ejerlejligheder samt ejendomme, der ejes af flere ka­te­gorier af ejere',
+		],
+		'BygSupplerendeVarme' => [
+			'0' => 'Ikke oplyst',
+			'1' => 'Varmepumpe',
+			'10' => 'Biogasanlæg',
+			'2' => 'Brændeovne og lignende med skorsten',
+			'3' => 'Biopejse og lignende uden skorsten',
+			'4' => 'Solvarmeanlæg',
+			'5' => 'Pejs',
+			'6' => 'Gasradiator',
+			'7' => 'Elvarme',
+			'80' => 'Andet',
+			'90' => '(UDFASES) Bygningen har ingen supplerende varme',
+		],
+		'BygVandforsyning' => [
+			'1' => 'Alment vandforsyningsanlæg',
+			'2' => 'Privat vandforsyningsanlæg',
+			'3' => 'Enkeltindvindingsanlæg',
+			'4' => 'Brønd',
+			'6' => 'Ikke alment vandforsyningsanlæg',
+			'7' => 'Vandforsyning er registreret på bygninger',
+			'9' => 'Ingen vandforsyning',
+		],
+		'DispensationFritagelseIftKollektivVarmeforsyning' => [
+			'1' => 'Dispensation er tidsbegrænset',
+			'2' => 'Dispensationen er ikke tidsbegrænset',
+		],
+		'Ejendomstype' => [
+			'1' => 'Matrikuleret Areal',
+			'2' => 'BPFG',
+			'3' => 'Ejerlejlighed',
+		],
+		'EnhDaekningsafgift' => [
+			'0' => 'Ikke omfattet af dækningsafgift',
+			'1' => 'Omfattet af dækningsafgift',
+		],
+		'EnhSupplerendeVarme' => [
+			'0' => 'Ikke oplyst',
+			'1' => 'Varmepumpe',
+			'10' => 'Biogasanlæg',
+			'2' => 'Brændeovne og lignende med skorsten',
+			'3' => 'Biopejse og lignende uden skorsten',
+			'4' => 'Solvarmeanlæg',
+			'5' => 'Pejs',
+			'6' => 'Gasradiator',
+			'7' => 'Elvarme',
+			'80' => 'Andet',
+			'90' => '(UDFASES) Bygningen har ingen supplerende varme',
+		],
+		'EnhVarmeinstallation' => [
+			'1' => 'Fjernvarme/blokvarme',
+			'2' => 'Centralvarme med én fyringsenhed',
+			'3' => 'Ovn til fast og flydende brændsel',
+			'5' => 'Varmepumpe',
+			'6' => 'Centralvarme med to fyringsenheder',
+			'7' => 'Elvarme',
+			'8' => 'Gasradiator',
+			'9' => 'Ingen varmeinstallation',
+			'99' => 'Varmeinstallation er registreret på enheder',
+		],
+		'EtageType' => [
+			'2' => 'Kælder',
+		],
+		'Fordelingsnoegle' => [
+			'1' => 'Manuel fordeling',
+			'2' => 'Ligelig fordeling',
+			'3' => 'Institutions fordeling',
+		],
+		'ForretningsHaendelse' => [
+			'BUH' => 'Bygning uden Husnummer',
+			'BYG' => 'Bygning',
+			'ENH' => 'Enhed',
+			'GRU' => 'Grund',
+			'SAG' => 'BBR-sag',
+			'TEK' => 'Teknisk Anlæg',
+			'TUH' => 'Teknisk Anlæg uden Husnummer',
+		],
+		'ForretningsOmraade' => [
+			'BBR' => '54.15.05.05',
+		],
+		'ForretningsProcess' => [
+			'0' => 'Ikke angivet',
+			'1' => 'Oprettet grundet nybyggeri',
+			'10' => 'Anmeldelsessag',
+			'11' => 'Tilladelsessag',
+			'12' => 'Opdateret grundet ændring i grunddataregister: Matriklen',
+			'13' => 'Opdateret grundet ændring i grunddataregister: DAR',
+			'14' => 'Opdateret grundet ændring i grunddataregister: Ejerfortegnelsen',
+			'15' => 'Opdateret grundet ændring i grunddataregister: Ejendomsbeliggenhedsregisteret',
+			'16' => 'Automatisk lukning af anmeldelsessag',
+			'17' => 'Flytning af underliggende elementer på matrikel (Matrikulær ændring)',
+			'18' => 'Fordelingsareal af fordelingsareal',
+			'19' => 'Opdateret grundet ændret Sikkerhedsklassificering',
+			'2' => 'Opdateret grundet til/ombygning',
+			'20' => 'Fremdatering af indflytning',
+			'21' => 'Opdatering af indberetning',
+			'22' => 'ESR Event Processering',
+			'23' => 'AWS Event Processering',
+			'24' => 'Indberetnings services',
+			'25' => 'SKATServices',
+			'26' => 'EnergiindberetningProcessering',
+			'27' => 'EJDbATilknytningHusnummerService',
+			'28' => 'BPFG Tilknyttet gennem Ajorføring hos MU',
+			'3' => 'Opdateret grundet nedrivning',
+			'4' => 'Fejlrettelse af faktiske fejlregistreringer og udeladelser',
+			'5' => 'Faktisk udført ændring uden byggesagsbehandling',
+			'6' => 'Opdeling af enheder',
+			'7' => 'Sammenlægning af enheder',
+			'8' => 'Opdateret som følge af digital indberetning fra borger mm.',
+			'9' => 'Opdateret som følge af digital indberetning fra SKAT',
+		],
+		'GodkendtTomBolig' => [
+			'0' => 'Krav om persontilmelding',
+			'100' => 'Bolig uden krav om persontilmelding',
+		],
+		'GruAfloebsforhold' => [
+			'1' => 'Fælleskloakeret: spildevand + tag- og overfladevand',
+			'10' => 'Afløb til offentligt kloaksystem',
+			'101' => 'SOP: Minirenseanlæg med direkte udledning',
+			'102' => 'SOP: Minirenseanlæg med udledning til markdræn',
+			'103' => 'SOP: Minirenseanlæg med nedsivning i faskine',
+			'104' => 'SOP: Nedsivning til sivedræn',
+			'105' => 'SOP: Samletank',
+			'106' => 'SOP: Pileanlæg med nedsivning (uden membran)',
+			'107' => 'SOP: Pileanlæg uden udledning (med membran)',
+			'108' => 'SOP: Beplantede filteranlæg med nedsivning i faskine',
+			'109' => 'SOP: Sandfiltre med P-fældning i bundfældningstanken og direkte udledning',
+			'11' => 'Afløb til fællesprivat kloaksystem',
+			'110' => 'SOP: Sandfiltre med P-fældning i bundfældningstanken og udledning til markdræn',
+			'12' => 'Afløb til fællesprivat kloaksystem med tilslutning til spildevandsforsyningens kloaksystem',
+			'190' => 'SOP: Andet',
+			'2' => 'Fælleskloakeret: spildevand + delvis tag- og overfladevand',
+			'20' => 'Afløb til samletank',
+			'201' => 'SO: Biologisk sandfilter med direkte udledning',
+			'202' => 'SO: Biologisk sandfilter med udledning til markdræn',
+			'203' => 'SO: Minirensanlæg med direkte udledning',
+			'204' => 'SO: Minirenseanlæg med udledning til markdræn',
+			'205' => 'SO: Beplantede filteranlæg med direkte udledning',
+			'206' => 'SO: Beplantede filteranlæg med udledning til markdræn',
+			'21' => 'Afløb til samletank for toiletvand og mekanisk rensning af øvrigt spildevand',
+			'29' => 'Mekanisk rensning med nedsivningsanlæg med tilladelse',
+			'290' => 'SO: Andet',
+			'3' => 'Fælleskloakeret: spildevand',
+			'30' => 'Mekanisk rensning med nedsivningsanlæg (tilladelse ikke påkrævet)',
+			'301' => 'OP: Minirenseanlæg med direkte udledning',
+			'302' => 'OP: Minirenseanlæg med udledning til markdræn',
+			'31' => 'Mekanisk rensning med privat udledning direkte til vandløb, søer eller havet',
+			'32' => 'Mekanisk og biologisk rensning (ældre anlæg uden renseklasse)',
+			'390' => 'OP: Andet',
+			'4' => 'Fælleskloakeret: tag- og overfladevand',
+			'401' => 'O: Rodzoneanlæg med direkte udledning',
+			'402' => 'O: Rodzoneanlæg med udledning til markdræn',
+			'403' => 'O: Minirenseanlæg med direkte udledning',
+			'404' => 'O: Minirenseanlæg med udledning til markdræn',
+			'490' => 'O: Andet',
+			'5' => 'Separatkloakeret: spildevand + tag- og overfladevand',
+			'501' => 'Øvrige renseløsninger: Mekanisk med direkte udledning',
+			'502' => 'Øvrige renseløsninger: Mekanisk med udledning til markdræn',
+			'503' => 'Øvrige renseløsninger: Ældre nedsivningsanlæg med nedsivning til sivebrønd',
+			'504' => 'Udledning til jordoverfladen',
+			'505' => 'Udledning urenset',
+			'590' => 'Øvrige renseløsninger: Andet',
+			'6' => 'Separatkloakeret: spildevand + delvis tag- og overfladevand',
+			'601' => 'Anden type afløb (større end 30 PE med egen udledning)',
+			'7' => 'Separatkloakeret: spildevand',
+			'70' => 'Udledning uden rensning direkte til vandløb, søer eller havet',
+			'701' => 'Intet afløb',
+			'75' => 'Afløbsforhold er registreret på bygninger',
+			'8' => 'Separatkloakeret: tag- og overfladevand',
+			'80' => 'Anden type afløb',
+			'9' => 'Spildevandskloakeret: Spildevand',
+			'90' => 'Ingen udledning',
+		],
+		'GruVandforsyning' => [
+			'1' => 'Alment vandforsyningsanlæg',
+			'2' => 'Privat vandforsyningsanlæg',
+			'3' => 'Enkeltindvindingsanlæg',
+			'4' => 'Brønd',
+			'6' => 'Ikke alment vandforsyningsanlæg',
+			'7' => 'Vandforsyning er registreret på bygninger',
+			'9' => 'Ingen vandforsyning',
+		],
+		'Gulvbelaegning' => [
+			'1' => 'Beton',
+			'2' => 'Andet',
+			'3' => 'Ingen',
+		],
+		'KildeTilKoordinatsaet' => [
+			'E' => 'Ejer',
+			'K' => 'Kommune',
+			'L' => 'Landinspektør',
+			'M' => 'Maskinelt dannet eller anden kilde',
+		],
+		'KondemneretBoligenhed' => [
+			'0' => 'Ikke kondemneret boligenhed',
+			'1' => 'Kondemneret boligenhed',
+		],
+		'Koordinatsystem' => [
+			'1' => '(UDFASES )System 34',
+			'2' => '(UDFASES) System 45',
+			'3' => '(UDFASES) KP2000 (System 2000)',
+			'4' => '(UDFASES) UTM ED50',
+			'5' => 'UTM 32 Euref89',
+		],
+		'KvalitetAfKoordinatsaet' => [
+			'1' => 'Sikker geokodning',
+			'2' => '(UDFASES) Næsten sikker',
+			'3' => 'Usikker geokodning',
+		],
+		'LovligAnvendelse' => [
+			'A' => 'Bolig har bevaret helårsstatus efter områdets udlægning til sommerhusområde',
+			'B' => 'Tidsbegrænset dispensation til helårsbeboelse til ejer. Dispensation bortfalder ved ejerskifte',
+			'C' => 'Dispensation til helårsbeboelse til ejer. Dispensation bortfalder ved ejerskifte',
+			'D' => 'Personlig ret for pensionister til helårsbeboelse',
+			'E' => 'Dispensation til afvikling af ulovlig helårsbeboelse',
+			'I' => 'Ikke relevant for denne enhed',
+		],
+		'NiveauType' => [
+			'1' => 'Grund',
+			'2' => 'Bygning',
+			'3' => 'TekniskAnlaeg',
+			'4' => 'Etage',
+			'5' => 'Opgang',
+			'6' => 'Enhed',
+		],
+		'OffentligStoette' => [
+			'0' => 'Ingen offentlig støtte',
+			'10' => 'Almen familiebolig',
+			'15' => 'Støttet privat udlejningsbolig',
+			'20' => 'Støttet privat andelsbolig',
+			'25' => 'Almen ungdomsbolig',
+			'30' => 'Støttet privat ungdomsbolig',
+			'40' => 'Almen ældrebolig',
+			'42' => 'Almen plejebolig',
+			'80' => 'Serviceareal',
+		],
+		'OmfattetAfByggeskadeforsikring' => [
+			'0' => 'Bygningen er ikke omfattet af byggeskadeforsikring',
+			'10' => 'Bygningen er omfattet af byggeskadeforsikring',
+			'11' => 'Bygningen er opført som selvbyg',
+			'12' => 'Udlejningsejendom',
+		],
+		'Oversvoemmelsesselvrisiko' => [
+			'0' => 'Ingen udbetalt erstatning fra Naturskaderådet',
+			'1' => '(UDFASES) Bygningens selvrisiko er forhøjet til trin 1',
+			'2' => '(UDFASES) Bygningens selvrisiko er forhøjet til trin 2',
+			'3' => 'Naturskaderådet registrerer, når der er udbetalt erstatning som følge af stormflod, oversvømmelse fra vandløb og søer og tørke. Læs om naturskadeordningerne på naturskaderaadet.dk.',
+		],
+		'Placering' => [
+			'0' => 'Ukendt',
+		],
+		'PaaSoeTerritorie' => [
+			'0' => 'Ikke på søterritorie',
+			'1' => 'På søterritorie',
+		],
+		'Rensningspaabud' => [
+			'6' => 'Skal tilsluttes spildevandsforsyningsselskab',
+			'7' => 'Skal tilsluttes separatkloakering',
+		],
+		'Sagsniveau' => [
+			'1' => 'Grund',
+			'2' => 'Bygning',
+			'3' => 'TekniskAnlaeg',
+			'4' => 'Etage',
+			'5' => 'Opgang',
+			'6' => 'Enhed',
+		],
+		'Sagstype' => [
+			'0' => 'Sag på grund',
+			'1' => 'Nybyggeri',
+			'2' => 'Til/ombygning',
+			'31' => 'Nedrivning (delvis)',
+			'32' => 'Nedrivning (hel)',
+		],
+		'Stoerrelsesklasse' => [
+			'1' => 'Under 6.000 l',
+			'2' => '6.000 l - 100.000 l',
+			'3' => 'Over 100.000 l',
+		],
+		'SupplerendeIndvendigKorrosionsbeskyttelse' => [
+			'1' => 'Glasfiberbelægning',
+			'2' => 'Organisk belægning',
+			'3' => 'Anoder',
+			'4' => 'Zinkstøvmaling',
+		],
+		'SupplerendeOplysningerOmKoordinatsaet' => [
+			'11' => 'Koordinatsæt ligger i bygningen/anlægget (over jorden)',
+			'12' => 'Koordinatsæt ligger i bygningen/anlægget (under jorden)',
+			'21' => '(UDFASES) Koordinatsæt ligger i bygningen/anlægget (over jorden)',
+			'22' => '(UDFASES) Koordinatsæt ligger i bygningen/anlægget (under jorden)',
+			'31' => 'Koordinatsæt ligger på matriklen',
+			'32' => 'Ukendt',
+		],
+		'Tilladelsesart' => [
+			'1' => 'Upersonlig tilladelse uden tidsbegrænsning',
+			'2' => 'Personlig tilladelse uden tidsbegrænsning',
+			'3' => 'Upersonlig tilladelse med tidsbegrænsing',
+			'4' => 'Personlig tilladelse med tidsbegrænsing',
+		],
+		'TilladelseTilAlternativBortskaffelseEllerAfledning' => [
+			'0' => 'Ikke oplyst',
+			'1' => 'Tilladelse meddelt',
+			'2' => 'Tilladelse bortfaldet',
+		],
+		'TilladelseTilUdtraeden' => [
+			'0' => 'Ikke oplyst',
+			'1' => 'Tilladelse meddelt',
+			'2' => 'Tilladelse bortfaldet',
+		],
+		'Udlejningsforhold' => [
+			'1' => 'Udlejet',
+			'2' => 'Benyttet af ejeren',
+			'3' => 'Ikke benyttet',
+		],
+	];
+
+	/**
+	 * Return the bundled label for one BBR code.
 	 *
 	 * @param string $list Official BBR code-list name used by this package.
 	 * @param string|null $code BBR code value.
@@ -672,6 +1194,9 @@ final class BbrCodeLists {
 			return null;
 		}
 
-		return self::LISTS[$list][$code] ?? null;
+		return self::LISTS[$list][$code]
+			?? self::VERIFIED_LISTS[$list][$code]
+			?? self::SUPPLEMENT_LISTS[$list][$code]
+			?? null;
 	}
 }

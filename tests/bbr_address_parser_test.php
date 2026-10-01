@@ -31,6 +31,7 @@ namespace {
 	require_once $root . '/src/Exception/PublicDataException.php';
 	require_once $root . '/src/Exception/InvalidResponseException.php';
 	require_once $root . '/src/Util/BbrCodeLists.php';
+	require_once $root . '/src/Util/BbrFieldCatalog.php';
 	require_once $root . '/src/Service/Bbr.php';
 
 	$service = (new \ReflectionClass(Bbr::class))->newInstanceWithoutConstructor();
@@ -117,8 +118,43 @@ namespace {
 	$ground = $invoke('normalizeGround', [
 		'id_lokalId' => '00000000-0000-0000-0000-000000000021',
 		'kommunekode' => '0810',
+		'gru022MedlemskabAfSpildevandsforsyning' => '2',
+		'gru023PaabudVedrSpildevandsafledning' => '5',
+		'gru024FristVedrSpildevandsafledning' => '2015-04-01T00:00:00Z',
 	], 'property');
 	$check(($ground['municipalityLabel'] ?? null) === 'Brønderslev Kommune', 'Ground municipality code receives its bundled label.');
+	$check(($ground['wastewaterMembershipLabel'] ?? null) === 'Medlemskab af spildevandsforsyning', 'Ground wastewater membership receives its bundled label.');
+	$check(($ground['wastewaterOrderLabel'] ?? null) === 'Rensning skal forbedres til O', 'Ground wastewater order receives its bundled label.');
+	$check(($ground['wastewaterOrderDeadline'] ?? null) === '2015-04-01T00:00:00Z', 'Ground wastewater order deadline is normalized.');
+
+	$building = $invoke('normalizeBuilding', [
+		'id_lokalId' => '00000000-0000-0000-0000-000000000024',
+		'byg123MedlemskabAfSpildevandsforsyning' => '2',
+		'byg124PaabudVedrSpildevandsafledning' => '5',
+		'byg125FristVedrSpildevandsafledning' => '2015-04-01T00:00:00Z',
+	], 'property');
+	$check(($building['wastewaterMembershipLabel'] ?? null) === 'Medlemskab af spildevandsforsyning', 'Building wastewater membership receives its bundled label.');
+	$check(($building['wastewaterOrderLabel'] ?? null) === 'Rensning skal forbedres til O', 'Building wastewater order receives its bundled label.');
+	$check(($building['wastewaterOrderDeadline'] ?? null) === '2015-04-01T00:00:00Z', 'Building wastewater order deadline is normalized.');
+
+	$unit = $invoke('normalizeUnit', [
+		'id_lokalId' => '00000000-0000-0000-0000-000000000025',
+		'enh065AntalVandskylledeToiletter' => 2,
+		'enh066AntalBadevaerelser' => 1,
+	], 'property');
+	$check(($unit['flushToiletCount'] ?? null) === 2, 'Unit flush-toilet count is normalized.');
+	$check(($unit['bathroomCount'] ?? null) === 1, 'Unit bathroom count is normalized.');
+
+	$groundFields = $invoke('groundFields');
+	$check(\str_contains($groundFields, 'gru024FristVedrSpildevandsafledning'), 'Ground query requests wastewater order deadline.');
+
+	$buildingFields = $invoke('buildingFields');
+	$check(\str_contains($buildingFields, 'byg124PaabudVedrSpildevandsafledning'), 'Building query requests wastewater order.');
+	$check(\str_contains($buildingFields, 'byg125FristVedrSpildevandsafledning'), 'Building query requests wastewater order deadline.');
+
+	$unitFields = $invoke('unitFields');
+	$check(\str_contains($unitFields, 'enh065AntalVandskylledeToiletter'), 'Unit query requests flush-toilet count.');
+	$check(\str_contains($unitFields, 'enh066AntalBadevaerelser'), 'Unit query requests bathroom count.');
 
 	$floor = $invoke('normalizeFloor', [
 		'id_lokalId' => '00000000-0000-0000-0000-000000000022',
