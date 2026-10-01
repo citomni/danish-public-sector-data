@@ -162,8 +162,12 @@ final class Registry {
 	 *
 	 * @var array<string|int, mixed>
 	 */
-	// public const array COMMANDS_CLI = [
-	// ];
+	public const array COMMANDS_CLI = [
+		'bbr:schema-check' => [
+			'command' => \CitOmni\DanishPublicSectorData\Command\BbrSchemaCheckCommand::class,
+			'description' => 'Compare live Datafordeler BBR schemas with the bundled package schemas.',
+		],
+	];
 
 
 }

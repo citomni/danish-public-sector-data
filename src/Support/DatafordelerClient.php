@@ -178,6 +178,72 @@ final class DatafordelerClient {
 	}
 
 	/**
+	 * Fetch one GraphQL schema document from Datafordeleren.
+	 *
+	 * Behavior:
+	 * - Uses Datafordeler's documented GET /schema endpoint.
+	 * - Applies the same API-key redaction and transport failure mapping as GraphQL queries.
+	 * - Returns the raw GraphQL SDL document without transforming it.
+	 *
+	 * @param string $service Datafordeler GraphQL service path, for example "flexibleCurrent" or "BBR".
+	 * @param string $version Service version in the form "vN".
+	 * @return string Non-empty GraphQL SDL document.
+	 * @throws \InvalidArgumentException When endpoint input is invalid.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\AuthenticationException When the API key is missing or rejected.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\RateLimitException When Datafordeleren rate-limits the request.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\RemoteServiceException When transport or HTTP execution fails.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the schema response is empty.
+	 */
+	public function schema(string $service, string $version): string {
+		$this->validateEndpoint($service, $version);
+
+		$apiKey = $this->apiKey();
+		$url = $this->baseUrl . '/' . $service . '/' . $version . '/schema';
+
+		try {
+			$response = $this->app->curl->execute([
+				'url' => $url,
+				'method' => 'GET',
+				'query' => [
+					'apiKey' => $apiKey,
+				],
+				'sensitive_query_keys' => [
+					'apiKey',
+				],
+				'headers' => [
+					'Content-Type: application/json',
+				],
+				'timeout' => $this->timeout,
+				'connect_timeout' => $this->connectTimeout,
+				'follow_redirects' => false,
+				'return_headers' => false,
+				'capture_info' => false,
+			]);
+		} catch (CurlException) {
+			throw new RemoteServiceException('Datafordeler schema transport failed.');
+		}
+
+		$statusCode = (int)$response['status_code'];
+		if ($statusCode === 401 || $statusCode === 403) {
+			throw new AuthenticationException('Datafordeler rejected the configured credentials.', $statusCode);
+		}
+		if ($statusCode === 429) {
+			throw new RateLimitException('Datafordeler rate limit exceeded.', $statusCode);
+		}
+		if (!$response['is_http_success']) {
+			throw new RemoteServiceException('Datafordeler schema endpoint returned an unsuccessful HTTP response.', $statusCode);
+		}
+
+		$body = $response['body'];
+		if (!\is_string($body) || \trim($body) === '') {
+			throw new InvalidResponseException('Datafordeler returned an empty GraphQL schema document.');
+		}
+
+		return $body;
+	}
+
+
+	/**
 	 * Return the configured Datafordeler API key.
 	 *
 	 * @return string Non-empty API key.

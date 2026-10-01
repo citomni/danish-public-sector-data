@@ -30,8 +30,8 @@ $check = static function (bool $condition, string $message) use (&$checks): void
 	++$checks;
 };
 
-$schema = \file_get_contents($root . '/_internal/BBR_V003.schema.graphql');
-$currentSchema = \file_get_contents($root . '/_internal/FLEX_CURRENT_V003.schema.graphql');
+$schema = \file_get_contents($root . '/resources/bbr/BBR_V003.schema.graphql');
+$currentSchema = \file_get_contents($root . '/resources/bbr/FLEX_CURRENT_V003.schema.graphql');
 $bbrSource = \file_get_contents($root . '/src/Service/Bbr.php');
 
 $check($schema !== false, 'Bundled BBR v3 schema is readable.');
