@@ -53,9 +53,9 @@ final class SkatVatWebClient {
 		$this->app = $app;
 
 		$cfg = $this->app->cfg->danish_public_sector_data->skat_vat_web;
-		$this->searchUrl = $this->httpsUrl((string)($cfg->search_url ?? ''), 'search_url');
-		$this->timeout = $this->normalizeTimeout($cfg->timeout ?? 15, 'timeout');
-		$this->connectTimeout = $this->normalizeTimeout($cfg->connect_timeout ?? 5, 'connect_timeout');
+		$this->searchUrl = $this->httpsUrl((string)$cfg->search_url, 'search_url');
+		$this->timeout = $this->normalizeTimeout($cfg->timeout, 'timeout');
+		$this->connectTimeout = $this->normalizeTimeout($cfg->connect_timeout, 'connect_timeout');
 	}
 
 	/**

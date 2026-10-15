@@ -54,8 +54,8 @@ final class Cvr extends BaseService {
 	protected function init(): void {
 		$cfg = $this->app->cfg->danish_public_sector_data->cvr;
 
-		$this->service = (string)($cfg->service ?? '');
-		$this->version = (string)($cfg->version ?? '');
+		$this->service = (string)$cfg->service;
+		$this->version = (string)$cfg->version;
 
 		if ($this->service === '' || $this->version === '') {
 			throw new \UnexpectedValueException('CVR Datafordeler service and version must be configured.');

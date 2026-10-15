@@ -90,33 +90,33 @@ final class Registry {
 	public const array CFG_COMMON = [
 		'danish_public_sector_data' => [
 			'datafordeler' => [
-				'base_url' => 'https://graphql.datafordeler.dk',
-				'timeout' => 15,
-				'connect_timeout' => 5,
+				'base_url'        => 'https://graphql.datafordeler.dk', // Datafordeler GraphQL base URL; must be HTTPS.
+				'timeout'         => 15,                                 // Request timeout in seconds, >= 0.
+				'connect_timeout' => 5,                                  // Connect timeout in seconds, >= 0.
 			],
 			'dkjord_wfs' => [
-				'base_url' => 'https://jord.miljoeportal.dk/geo/wfs',
-				'timeout' => 15,
-				'connect_timeout' => 5,
+				'base_url'        => 'https://jord.miljoeportal.dk/geo/wfs', // DKjord WFS endpoint of Danmarks Miljøportal; must be HTTPS.
+				'timeout'         => 15,                                     // Request timeout in seconds, > 0.
+				'connect_timeout' => 5,                                      // Connect timeout in seconds, > 0.
 			],
 			'skat_vat_web' => [
-				'search_url' => 'https://ntse.skat.dk/ntse-front/public/momsnummer/soeg',
-				'timeout' => 15,
-				'connect_timeout' => 5,
+				'search_url'      => 'https://ntse.skat.dk/ntse-front/public/momsnummer/soeg', // SKAT's public VAT-number search page; must be HTTPS.
+				'timeout'         => 15,                                                       // Request timeout in seconds, >= 0.
+				'connect_timeout' => 5,                                                        // Connect timeout in seconds, >= 0.
 			],
 			'bbr' => [
-				'current_service' => 'flexibleCurrent',
-				'current_version' => 'v3',
-				'history_service' => 'BBR',
-				'history_version' => 'v3',
+				'current_service' => 'flexibleCurrent', // Datafordeler service for current BBR data; must not be empty.
+				'current_version' => 'v3',              // Version of that service; must not be empty.
+				'history_service' => 'BBR',             // Datafordeler service for BBR history; must not be empty.
+				'history_version' => 'v3',              // Version of that service; must not be empty.
 			],
 			'soil_contamination' => [
-				'matrikel_service' => 'flexibleCurrent',
-				'matrikel_version' => 'v3',
+				'matrikel_service' => 'flexibleCurrent', // Datafordeler service for current Matriklen data; must not be empty.
+				'matrikel_version' => 'v3',              // Version of that service; must not be empty.
 			],
 			'cvr' => [
-				'service' => 'flexibleCurrent',
-				'version' => 'v3',
+				'service' => 'flexibleCurrent', // Datafordeler service for CVR data; must not be empty.
+				'version' => 'v3',              // Version of that service; must not be empty.
 			],
 		],
 	];

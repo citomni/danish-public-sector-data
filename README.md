@@ -313,7 +313,13 @@ Internal transport helpers are not registered as host-app services.
 
 Package-owned defaults live under `danish_public_sector_data` in
 `src/Boot/Registry.php` and may be overridden by the host app through normal
-CitOmni configuration precedence.
+CitOmni configuration precedence. The services read these keys directly, so the
+baseline is the only source of their defaults. A local test checks every cfg read
+in `src/` against the baseline:
+
+```bash
+php tests/cfg_reads_test.php
+```
 
 ## Data and licensing
 

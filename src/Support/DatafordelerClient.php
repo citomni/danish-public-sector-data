@@ -62,7 +62,7 @@ final class DatafordelerClient {
 
 		$cfg = $this->app->cfg->danish_public_sector_data->datafordeler;
 
-		$baseUrl = (string)($cfg->base_url ?? '');
+		$baseUrl = (string)$cfg->base_url;
 		$baseUrl = \rtrim($baseUrl, '/');
 
 		if ($baseUrl === '' || !\str_starts_with($baseUrl, 'https://')) {
@@ -70,8 +70,8 @@ final class DatafordelerClient {
 		}
 
 		$this->baseUrl        = $baseUrl;
-		$this->timeout        = $this->normalizeTimeout($cfg->timeout ?? 15, 'timeout');
-		$this->connectTimeout = $this->normalizeTimeout($cfg->connect_timeout ?? 5, 'connect_timeout');
+		$this->timeout        = $this->normalizeTimeout($cfg->timeout, 'timeout');
+		$this->connectTimeout = $this->normalizeTimeout($cfg->connect_timeout, 'connect_timeout');
 	}
 
 	/**

@@ -64,10 +64,10 @@ final class Bbr extends BaseService {
 	protected function init(): void {
 		$cfg = $this->app->cfg->danish_public_sector_data->bbr;
 
-		$this->currentService = (string)($cfg->current_service ?? '');
-		$this->currentVersion = (string)($cfg->current_version ?? '');
-		$this->historyService = (string)($cfg->history_service ?? '');
-		$this->historyVersion = (string)($cfg->history_version ?? '');
+		$this->currentService = (string)$cfg->current_service;
+		$this->currentVersion = (string)$cfg->current_version;
+		$this->historyService = (string)$cfg->history_service;
+		$this->historyVersion = (string)$cfg->history_version;
 
 		if (
 			$this->currentService === ''

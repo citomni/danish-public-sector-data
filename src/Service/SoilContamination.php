@@ -78,8 +78,8 @@ final class SoilContamination extends BaseService {
 	protected function init(): void {
 		$cfg = $this->app->cfg->danish_public_sector_data->soil_contamination;
 
-		$this->matrikelService = (string)($cfg->matrikel_service ?? '');
-		$this->matrikelVersion = (string)($cfg->matrikel_version ?? '');
+		$this->matrikelService = (string)$cfg->matrikel_service;
+		$this->matrikelVersion = (string)$cfg->matrikel_version;
 
 		if ($this->matrikelService === '' || $this->matrikelVersion === '') {
 			throw new \UnexpectedValueException('Soil contamination Matriklen service and version must be configured.');

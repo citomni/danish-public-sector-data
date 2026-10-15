@@ -58,15 +58,15 @@ final class DkJordWfsClient {
 		$this->app = $app;
 
 		$cfg = $this->app->cfg->danish_public_sector_data->dkjord_wfs;
-		$baseUrl = \rtrim((string)($cfg->base_url ?? ''), '/');
+		$baseUrl = \rtrim((string)$cfg->base_url, '/');
 
 		if ($baseUrl === '' || !\str_starts_with($baseUrl, 'https://')) {
 			throw new \UnexpectedValueException('DKjord WFS base_url must be a non-empty HTTPS URL.');
 		}
 
 		$this->baseUrl = $baseUrl;
-		$this->timeout = $this->normalizeTimeout($cfg->timeout ?? 15, 'timeout');
-		$this->connectTimeout = $this->normalizeTimeout($cfg->connect_timeout ?? 5, 'connect_timeout');
+		$this->timeout = $this->normalizeTimeout($cfg->timeout, 'timeout');
+		$this->connectTimeout = $this->normalizeTimeout($cfg->connect_timeout, 'connect_timeout');
 	}
 
 	/**
