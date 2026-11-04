@@ -20,203 +20,99 @@ use CitOmni\DanishPublicSectorData\Support\DatafordelerClient;
 use CitOmni\Kernel\Service\BaseService;
 
 /**
- * Cvr: Read normalized Danish company data from the official CVR register.
+ * Cvr: Read normalized Danish company and production-unit data from the official CVR register.
  *
  * Behavior:
- * - Looks up one company by its eight-digit CVR number through Datafordeler flexibleCurrent.
- * - Returns normalized identity, status, addresses, contact data, industries, and company form.
+ * - Looks up companies by eight-digit CVR number and production units by ten-digit P-number
+ *   through Datafordeler flexibleCurrent, one number at a time or many per call.
+ * - Returns normalized identity, status, addresses, contact data, and industries for companies
+ *   and production units alike, plus the company form for companies.
+ * - Returns a company with its production units when the caller asks for them, and a
+ *   production unit with the CVR number of its company.
  * - Prefers the registered location address and keeps the explicit postal address separately.
- * - Returns null when no matching company exists.
+ * - Returns null for a number without a matching company or production unit.
  *
  * Notes:
  * - Datafordeler-specific GraphQL relation names are contained inside this service.
- * - The public result shape is intentionally independent of the upstream GraphQL schema.
- * - Only non-access-restricted company data is queried.
+ * - The public result shapes are intentionally independent of the upstream GraphQL schema.
+ * - Only non-access-restricted CVR data is queried.
  *
  * Typical usage:
  *   $company = $this->app->cvr->getCompany('12345678');
+ *   $units = $this->app->cvr->getProductionUnits(['1234567890', '1234567891']);
  *
- * @throws \InvalidArgumentException When the CVR number is not exactly eight digits.
+ * @phpstan-type CvrAddress array{
+ *     type:?string,
+ *     formatted:?string,
+ *     careOf:?string,
+ *     street:?string,
+ *     houseNumberFrom:?string,
+ *     houseNumberTo:?string,
+ *     floor:?string,
+ *     door:?string,
+ *     postalCode:?string,
+ *     city:?string,
+ *     supplementaryCity:?string,
+ *     countryCode:?string,
+ *     freeText:?string
+ * }
+ * @phpstan-type CvrIndustry array{code:string,name:string,sequence:int}
+ * @phpstan-type CvrIndustries array{primary:CvrIndustry|null,secondary:list<CvrIndustry>}
+ * @phpstan-type CvrContact array{email:?string,phone:?string,marketingProtected:?bool}
+ * @phpstan-type CvrEntity array{
+ *     name:?string,
+ *     address:CvrAddress|null,
+ *     postalAddress:CvrAddress|null,
+ *     contact:CvrContact,
+ *     industries:CvrIndustries
+ * }
+ * @phpstan-type CvrProductionUnit array{
+ *     pNumber:string,
+ *     cvrNumber:string,
+ *     name:?string,
+ *     status:?string,
+ *     startDate:?string,
+ *     endDate:?string,
+ *     attachmentStartDate:?string,
+ *     attachmentEndDate:?string,
+ *     address:CvrAddress|null,
+ *     postalAddress:CvrAddress|null,
+ *     contact:CvrContact,
+ *     industries:CvrIndustries
+ * }
+ * @phpstan-type CvrCompany array{
+ *     cvrNumber:string,
+ *     name:?string,
+ *     status:?string,
+ *     startDate:?string,
+ *     endDate:?string,
+ *     companyType:array{code:?string,name:?string}|null,
+ *     address:CvrAddress|null,
+ *     postalAddress:CvrAddress|null,
+ *     contact:CvrContact,
+ *     industries:CvrIndustries,
+ *     productionUnits:list<CvrProductionUnit>|null
+ * }
+ *
+ * @throws \InvalidArgumentException When a CVR number or P-number is malformed.
  * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When the remote lookup fails.
  */
 final class Cvr extends BaseService {
 
-	private DatafordelerClient $datafordeler;
-	private string $service;
-	private string $version;
+	/** Maximum number of identifiers in one in filter, and the page size of a lookup by identifiers. */
+	private const int IDENTIFIER_BATCH_SIZE = 100; // Datafordeler accepts at most 100 values in an in filter.
 
-	/**
-	 * Load the package-owned CVR endpoint selection.
-	 *
-	 * @return void
-	 * @throws \UnexpectedValueException When endpoint configuration is invalid.
-	 */
-	protected function init(): void {
-		$cfg = $this->app->cfg->danish_public_sector_data->cvr;
+	/** Page size of the production units of a batch of companies. */
+	private const int PAGE_SIZE = 1000; // Largest page Datafordeler serves.
 
-		$this->service = (string)$cfg->service;
-		$this->version = (string)$cfg->version;
+	/** CVR number accepted for lookup: eight digits, the first of them 1-9. */
+	private const string CVR_NUMBER_PATTERN = '/^[1-9][0-9]{7}$/D'; // Numbers become GraphQL Long literals, which cannot start with 0.
 
-		if ($this->service === '' || $this->version === '') {
-			throw new \UnexpectedValueException('CVR Datafordeler service and version must be configured.');
-		}
+	/** P-number accepted for lookup: ten digits, the first of them 1-9. */
+	private const string P_NUMBER_PATTERN = '/^[1-9][0-9]{9}$/D'; // Numbers become GraphQL Long literals, which cannot start with 0.
 
-		$this->datafordeler = new DatafordelerClient($this->app);
-	}
-
-	/**
-	 * Return one normalized CVR company record.
-	 *
-	 * @param string $cvrNumber Exact eight-digit CVR number.
-	 * @return array{
-	 *     cvrNumber:string,
-	 *     name:?string,
-	 *     status:?string,
-	 *     startDate:?string,
-	 *     endDate:?string,
-	 *     companyType:array{code:?string,name:?string}|null,
-	 *     address:array{
-	 *         type:?string,
-	 *         formatted:?string,
-	 *         careOf:?string,
-	 *         street:?string,
-	 *         houseNumberFrom:?string,
-	 *         houseNumberTo:?string,
-	 *         floor:?string,
-	 *         door:?string,
-	 *         postalCode:?string,
-	 *         city:?string,
-	 *         supplementaryCity:?string,
-	 *         countryCode:?string,
-	 *         freeText:?string
-	 *     }|null,
-	 *     postalAddress:array{
-	 *         type:?string,
-	 *         formatted:?string,
-	 *         careOf:?string,
-	 *         street:?string,
-	 *         houseNumberFrom:?string,
-	 *         houseNumberTo:?string,
-	 *         floor:?string,
-	 *         door:?string,
-	 *         postalCode:?string,
-	 *         city:?string,
-	 *         supplementaryCity:?string,
-	 *         countryCode:?string,
-	 *         freeText:?string
-	 *     }|null,
-	 *     contact:array{email:?string,phone:?string,marketingProtected:?bool},
-	 *     industries:array{
-	 *         primary:array{code:string,name:string,sequence:int}|null,
-	 *         secondary:list<array{code:string,name:string,sequence:int}>
-	 *     }
-	 * }|null Normalized company data, or null when the CVR number does not exist.
-	 * @throws \InvalidArgumentException When the CVR number is not exactly eight digits.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When the remote lookup fails or is malformed.
-	 */
-	public function getCompany(string $cvrNumber): ?array {
-		if (!\preg_match('/^[0-9]{8}$/D', $cvrNumber)) {
-			throw new \InvalidArgumentException('CVR number must contain exactly eight digits.');
-		}
-
-		$query = $this->buildCompanyQuery($cvrNumber);
-		$data  = $this->datafordeler->query($this->service, $this->version, $query);
-
-		$connection = $data['CVR_Virksomhed'] ?? null;
-		if (!\is_array($connection)) {
-			throw new InvalidResponseException('CVR response does not contain a valid CVR_Virksomhed connection.');
-		}
-
-		$nodes = $connection['nodes'] ?? null;
-		if (!\is_array($nodes)) {
-			throw new InvalidResponseException('CVR response does not contain a valid company node list.');
-		}
-		if ($nodes === []) {
-			return null;
-		}
-
-		$company = $nodes[0] ?? null;
-		if (!\is_array($company)) {
-			throw new InvalidResponseException('CVR response contains an invalid company node.');
-		}
-
-		$returnedCvr = self::nullableString($company['CVRNummer'] ?? null);
-		if ($returnedCvr !== $cvrNumber) {
-			throw new InvalidResponseException('CVR response contains an unexpected CVR number.');
-		}
-
-		$entity = $this->firstConnectionNode($company['id_CVR_CVREnhed_id_ref'] ?? null, 'CVR entity relation');
-
-		$name = null;
-		$addresses = [
-			'address' => null,
-			'postalAddress' => null,
-		];
-		$contact = [
-			'email' => null,
-			'phone' => null,
-			'marketingProtected' => null,
-		];
-		$industries = [
-			'primary' => null,
-			'secondary' => [],
-		];
-
-		if ($entity !== null) {
-			$nameRelation = $entity['id_CVR_Navn_CVREnhedsId_ref'] ?? null;
-			if ($nameRelation !== null && !\is_array($nameRelation)) {
-				throw new InvalidResponseException('CVR response contains an invalid name relation.');
-			}
-			$name = \is_array($nameRelation) ? self::nullableString($nameRelation['vaerdi'] ?? null) : null;
-
-			$addresses = $this->normalizeAddresses($entity['id_CVR_Adressering_CVREnhedsId_ref'] ?? null);
-			$contact = [
-				'email' => $this->normalizeValueRelation($entity['id_CVR_e_mailadresse_CVREnhedsId_ref'] ?? null, 'email relation'),
-				'phone' => $this->normalizeValueRelation($entity['id_CVR_Telefonnummer_CVREnhedsId_ref'] ?? null, 'phone relation'),
-				'marketingProtected' => $this->normalizeBooleanValueRelation($entity['id_CVR_Reklamebeskyttelse_CVREnhedsId_ref'] ?? null),
-			];
-			$industries = $this->normalizeIndustries($entity['id_CVR_Branche_CVREnhedsId_ref'] ?? null);
-		}
-
-		$companyType = $this->normalizeCompanyType($company['id_CVR_Virksomhedsform_CVREnhedsId_ref'] ?? null);
-
-		return [
-			'cvrNumber' => $cvrNumber,
-			'name' => $name,
-			'status' => self::nullableString($company['status'] ?? null),
-			'startDate' => self::nullableString($company['virksomhedStartdato'] ?? null),
-			'endDate' => self::nullableString($company['virksomhedOphoersdato'] ?? null),
-			'companyType' => $companyType,
-			'address' => $addresses['address'],
-			'postalAddress' => $addresses['postalAddress'],
-			'contact' => $contact,
-			'industries' => $industries,
-		];
-	}
-
-	/**
-	 * Build the flexibleCurrent company-profile query used by getCompany().
-	 *
-	 * @param string $cvrNumber Validated eight-digit CVR number.
-	 * @return string GraphQL query document.
-	 */
-	private function buildCompanyQuery(string $cvrNumber): string {
-		$effectiveAt = \gmdate('Y-m-d\\TH:i:s\\Z');
-
-		return <<<GRAPHQL
-query GetCvrCompany {
-	CVR_Virksomhed(
-		first: 1
-		virkningstid: "{$effectiveAt}"
-		where: { CVRNummer: { eq: {$cvrNumber} } }
-	) {
-		nodes {
-			status
-			CVRNummer
-			virksomhedStartdato
-			virksomhedOphoersdato
-			id_CVR_CVREnhed_id_ref(first: 1) {
-				nodes {
+	/** GraphQL selection of the name, address, industry, and contact relations of one CVR entity. */
+	private const string ENTITY_SELECTION = <<<'GRAPHQL'
 					id_CVR_Navn_CVREnhedsId_ref {
 						vaerdi
 					}
@@ -262,6 +158,308 @@ query GetCvrCompany {
 					id_CVR_Reklamebeskyttelse_CVREnhedsId_ref {
 						vaerdi
 					}
+GRAPHQL;
+
+	private DatafordelerClient $datafordeler;
+	private string $service;
+	private string $version;
+
+	/**
+	 * Load the package-owned CVR endpoint selection.
+	 *
+	 * @return void
+	 * @throws \UnexpectedValueException When endpoint configuration is invalid.
+	 */
+	protected function init(): void {
+		$cfg = $this->app->cfg->danish_public_sector_data->cvr;
+
+		$this->service = (string)$cfg->service;
+		$this->version = (string)$cfg->version;
+
+		if ($this->service === '' || $this->version === '') {
+			throw new \UnexpectedValueException('CVR Datafordeler service and version must be configured.');
+		}
+
+		$this->datafordeler = new DatafordelerClient($this->app);
+	}
+
+	// ----------------------------------------------------------------
+	// Lookups
+	// ----------------------------------------------------------------
+
+	/**
+	 * Return one normalized CVR company record.
+	 *
+	 * Typical usage:
+	 *   $company = $this->app->cvr->getCompany('12345678');
+	 *   $company = $this->app->cvr->getCompany('12345678', withProductionUnits: true);
+	 *
+	 * @param int|string $cvrNumber Eight digits, the first of them 1-9.
+	 * @param bool $withProductionUnits True also loads the company's production units into productionUnits.
+	 * @return CvrCompany|null Normalized company data, or null when Datafordeler has no company with the number.
+	 * @throws \InvalidArgumentException When the CVR number does not have eight digits or starts with 0.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When the remote lookup fails or is malformed.
+	 * @see \CitOmni\DanishPublicSectorData\Service\Cvr::getCompanies() The requests behind the lookup and what productionUnits holds.
+	 */
+	public function getCompany(int|string $cvrNumber, bool $withProductionUnits = false): ?array {
+		return $this->getCompanies([$cvrNumber], $withProductionUnits)[(int)$cvrNumber];
+	}
+
+	/**
+	 * Return normalized CVR company records for many CVR numbers.
+	 *
+	 * Behavior:
+	 * - Returns one entry per distinct CVR number, keyed by that number in the order the numbers
+	 *   first occur. An entry is null when Datafordeler has no company with the number.
+	 * - Sends the numbers in batches of up to 100. A batch takes one request per page of up to
+	 *   100 companies and, with production units and at least one company found, one request per
+	 *   page of up to 1000 production units of the companies found.
+	 * - productionUnits holds the production units that Datafordeler attaches to the company,
+	 *   unfiltered by status or end date and ordered by P-number. It is null when
+	 *   $withProductionUnits is false.
+	 * - Every request of one call uses the same effect time: the time of the call.
+	 *
+	 * Typical usage:
+	 *   $companies = $this->app->cvr->getCompanies(['12345678', '87654321'], withProductionUnits: true);
+	 *
+	 * @param array<array-key,int|string> $cvrNumbers CVR numbers of eight digits, the first of them 1-9. A repeated number is looked up once.
+	 * @param bool $withProductionUnits True also loads the production units of the companies into productionUnits.
+	 * @return array<int,CvrCompany|null> Normalized company data keyed by CVR number.
+	 * @throws \InvalidArgumentException When a CVR number is not an int or string of eight digits starting with 1-9.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When a remote lookup fails or is malformed.
+	 */
+	public function getCompanies(array $cvrNumbers, bool $withProductionUnits = false): array {
+		$requested = self::lookupNumbers(
+			$cvrNumbers,
+			self::CVR_NUMBER_PATTERN,
+			'CVR number must be an int or a string of exactly eight digits, the first of them 1-9.'
+		);
+		if ($requested === []) {
+			return [];
+		}
+
+		$effectiveAt = \gmdate('Y-m-d\\TH:i:s\\Z');
+		$companies = \array_fill_keys($requested, null);
+
+		foreach (\array_chunk($requested, self::IDENTIFIER_BATCH_SIZE) as $batch) {
+			$expected = \array_flip($batch);
+			$found = [];
+
+			$nodes = $this->connectionNodes(
+				'CVR_Virksomhed',
+				static fn(?string $after): string => self::companiesQuery($batch, $effectiveAt, $after)
+			);
+			foreach ($nodes as $node) {
+				$company = $this->normalizeCompany($node);
+				$cvrNumber = (int)$company['cvrNumber'];
+				if (!isset($expected[$cvrNumber])) {
+					throw new InvalidResponseException('CVR response contains an unexpected CVR number.');
+				}
+
+				// One row per company is expected at one effect time; the first row wins over a repeat.
+				$found[$cvrNumber] ??= $company;
+			}
+
+			if ($withProductionUnits && $found !== []) {
+				$foundNumbers = \array_keys($found);
+				$units = [];
+
+				$nodes = $this->connectionNodes(
+					'CVR_Produktionsenhed',
+					static fn(?string $after): string => self::productionUnitsQuery(
+						'tilknyttetVirksomhedsCVRNummer',
+						$foundNumbers,
+						self::PAGE_SIZE,
+						$effectiveAt,
+						$after
+					)
+				);
+				foreach ($nodes as $node) {
+					$unit = $this->normalizeProductionUnit($node);
+					$cvrNumber = (int)$unit['cvrNumber'];
+					if (!isset($found[$cvrNumber])) {
+						throw new InvalidResponseException('CVR response contains a production unit of an unexpected company.');
+					}
+
+					$units[$cvrNumber][(int)$unit['pNumber']] ??= $unit;
+				}
+
+				foreach ($foundNumbers as $cvrNumber) {
+					$companyUnits = $units[$cvrNumber] ?? [];
+					\ksort($companyUnits);
+					$found[$cvrNumber]['productionUnits'] = \array_values($companyUnits);
+				}
+			}
+
+			foreach ($found as $cvrNumber => $company) {
+				$companies[$cvrNumber] = $company;
+			}
+		}
+
+		return $companies;
+	}
+
+	/**
+	 * Return one normalized CVR production-unit record.
+	 *
+	 * Typical usage:
+	 *   $unit = $this->app->cvr->getProductionUnit('1234567890');
+	 *
+	 * @param int|string $pNumber Ten digits, the first of them 1-9.
+	 * @return CvrProductionUnit|null Normalized production-unit data, or null when Datafordeler has no production unit with the number.
+	 * @throws \InvalidArgumentException When the P-number does not have ten digits or starts with 0.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When the remote lookup fails or is malformed.
+	 * @see \CitOmni\DanishPublicSectorData\Service\Cvr::getProductionUnits() The requests behind the lookup.
+	 */
+	public function getProductionUnit(int|string $pNumber): ?array {
+		return $this->getProductionUnits([$pNumber])[(int)$pNumber];
+	}
+
+	/**
+	 * Return normalized CVR production-unit records for many P-numbers.
+	 *
+	 * Behavior:
+	 * - Returns one entry per distinct P-number, keyed by that number in the order the numbers
+	 *   first occur. An entry is null when Datafordeler has no production unit with the number.
+	 * - Sends the numbers in batches of up to 100. A batch takes one request per page of up to
+	 *   100 production units.
+	 * - cvrNumber of a record is the company that the production unit is attached to.
+	 * - Every request of one call uses the same effect time: the time of the call.
+	 *
+	 * Typical usage:
+	 *   $units = $this->app->cvr->getProductionUnits(['1234567890', '1234567891']);
+	 *
+	 * @param array<array-key,int|string> $pNumbers P-numbers of ten digits, the first of them 1-9. A repeated number is looked up once.
+	 * @return array<int,CvrProductionUnit|null> Normalized production-unit data keyed by P-number.
+	 * @throws \InvalidArgumentException When a P-number is not an int or string of ten digits starting with 1-9.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When a remote lookup fails or is malformed.
+	 */
+	public function getProductionUnits(array $pNumbers): array {
+		$requested = self::lookupNumbers(
+			$pNumbers,
+			self::P_NUMBER_PATTERN,
+			'P-number must be an int or a string of exactly ten digits, the first of them 1-9.'
+		);
+		if ($requested === []) {
+			return [];
+		}
+
+		$effectiveAt = \gmdate('Y-m-d\\TH:i:s\\Z');
+		$units = \array_fill_keys($requested, null);
+
+		foreach (\array_chunk($requested, self::IDENTIFIER_BATCH_SIZE) as $batch) {
+			$expected = \array_flip($batch);
+
+			$nodes = $this->connectionNodes(
+				'CVR_Produktionsenhed',
+				static fn(?string $after): string => self::productionUnitsQuery(
+					'pNummer',
+					$batch,
+					self::IDENTIFIER_BATCH_SIZE,
+					$effectiveAt,
+					$after
+				)
+			);
+			foreach ($nodes as $node) {
+				$unit = $this->normalizeProductionUnit($node);
+				$pNumber = (int)$unit['pNumber'];
+				if (!isset($expected[$pNumber])) {
+					throw new InvalidResponseException('CVR response contains an unexpected P-number.');
+				}
+
+				$units[$pNumber] ??= $unit;
+			}
+		}
+
+		return $units;
+	}
+
+	// ----------------------------------------------------------------
+	// Requests
+	// ----------------------------------------------------------------
+
+	/**
+	 * Yield the nodes of every page of one root connection.
+	 *
+	 * Behavior:
+	 * - Yields the nodes in response order, one page at a time.
+	 * - Requests the next page only when the nodes of the current page have been consumed.
+	 *
+	 * @param string $root Root field of the query documents.
+	 * @param callable(?string):string $query Builder of the query document for one page; its argument is the cursor of the previous page, null for the first.
+	 * @return \Generator<int,array<string,mixed>,mixed,void> Nodes of every page.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When a page is malformed or announces a cursor that was already used.
+	 */
+	private function connectionNodes(string $root, callable $query): \Generator {
+		$cursor = null;
+		$usedCursors = [];
+
+		do {
+			$data = $this->datafordeler->query($this->service, $this->version, $query($cursor));
+
+			$connection = $data[$root] ?? null;
+			if (!\is_array($connection) || !\is_array($connection['nodes'] ?? null) || !\is_array($connection['pageInfo'] ?? null)) {
+				throw new InvalidResponseException('CVR response does not contain a valid ' . $root . ' connection.');
+			}
+
+			$hasNextPage = $connection['pageInfo']['hasNextPage'] ?? null;
+			if (!\is_bool($hasNextPage)) {
+				throw new InvalidResponseException('CVR response contains invalid ' . $root . ' page information.');
+			}
+
+			$cursor = null;
+			if ($hasNextPage) {
+				$cursor = $connection['pageInfo']['endCursor'] ?? null;
+
+				// A cursor that comes back would request the same pages forever.
+				if (!\is_string($cursor) || $cursor === '' || isset($usedCursors[$cursor])) {
+					throw new InvalidResponseException('CVR response does not advance the ' . $root . ' pagination.');
+				}
+				$usedCursors[$cursor] = true;
+			}
+
+			foreach ($connection['nodes'] as $node) {
+				if (!\is_array($node)) {
+					throw new InvalidResponseException('CVR response contains an invalid ' . $root . ' node.');
+				}
+
+				yield $node;
+			}
+
+			// Release the raw page before the next one is requested.
+			unset($data, $connection);
+		} while ($cursor !== null);
+	}
+
+	/**
+	 * Build the query document for one page of companies.
+	 *
+	 * @param list<int> $cvrNumbers At most 100 CVR numbers.
+	 * @param string $effectiveAt UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param string|null $after Cursor of the previous page, or null for the first page.
+	 * @return string GraphQL query document.
+	 */
+	private static function companiesQuery(array $cvrNumbers, string $effectiveAt, ?string $after): string {
+		$first = self::IDENTIFIER_BATCH_SIZE;
+		$afterArgument = self::afterArgument($after);
+		$numberList = \implode(', ', $cvrNumbers);
+		$entity = self::ENTITY_SELECTION;
+
+		return <<<GRAPHQL
+query CvrCompanies {
+	CVR_Virksomhed(
+		first: {$first}{$afterArgument}
+		virkningstid: "{$effectiveAt}"
+		where: { CVRNummer: { in: [{$numberList}] } }
+	) {
+		nodes {
+			status
+			CVRNummer
+			virksomhedStartdato
+			virksomhedOphoersdato
+			id_CVR_CVREnhed_id_ref(first: 1) {
+				nodes {
+{$entity}
 				}
 			}
 			id_CVR_Virksomhedsform_CVREnhedsId_ref {
@@ -269,9 +467,202 @@ query GetCvrCompany {
 				vaerdiTekst
 			}
 		}
+		pageInfo {
+			hasNextPage
+			endCursor
+		}
 	}
 }
 GRAPHQL;
+	}
+
+	/**
+	 * Build the query document for one page of production units.
+	 *
+	 * @param string $filterField pNummer to select units by P-number, or tilknyttetVirksomhedsCVRNummer to select them by company.
+	 * @param list<int> $numbers At most 100 values of the filter field.
+	 * @param int $first Page size, 1 to 1000.
+	 * @param string $effectiveAt UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param string|null $after Cursor of the previous page, or null for the first page.
+	 * @return string GraphQL query document.
+	 */
+	private static function productionUnitsQuery(string $filterField, array $numbers, int $first, string $effectiveAt, ?string $after): string {
+		$afterArgument = self::afterArgument($after);
+		$numberList = \implode(', ', $numbers);
+		$entity = self::ENTITY_SELECTION;
+
+		return <<<GRAPHQL
+query CvrProductionUnits {
+	CVR_Produktionsenhed(
+		first: {$first}{$afterArgument}
+		virkningstid: "{$effectiveAt}"
+		where: { {$filterField}: { in: [{$numberList}] } }
+	) {
+		nodes {
+			pNummer
+			tilknyttetVirksomhedsCVRNummer
+			status
+			produktionsenhedStartdato
+			produktionsenhedOphoersdato
+			tilknyttetTilVirksomhedStartdato
+			tilknyttetTilVirksomhedOphoersdato
+			id_CVR_CVREnhed_id_ref(first: 1) {
+				nodes {
+{$entity}
+				}
+			}
+		}
+		pageInfo {
+			hasNextPage
+			endCursor
+		}
+	}
+}
+GRAPHQL;
+	}
+
+	/**
+	 * Build the after argument of a page request.
+	 *
+	 * @param string|null $after Cursor of the previous page, or null for the first page.
+	 * @return string Argument line with its leading line break, or an empty string for the first page.
+	 */
+	private static function afterArgument(?string $after): string {
+		if ($after === null) {
+			return '';
+		}
+
+		// A JSON string literal is also a valid GraphQL string literal.
+		return "\n\t\tafter: " . \json_encode($after, \JSON_THROW_ON_ERROR | \JSON_UNESCAPED_SLASHES | \JSON_UNESCAPED_UNICODE);
+	}
+
+	/**
+	 * Validate lookup numbers and drop repeats.
+	 *
+	 * @param array<array-key,mixed> $numbers Requested numbers.
+	 * @param string $pattern Pattern that the decimal form of every number must match.
+	 * @param string $message Exception message for a number that does not match.
+	 * @return list<int> Distinct numbers in the order they first occur.
+	 * @throws \InvalidArgumentException When a number is neither an int nor a string, or its decimal form does not match the pattern.
+	 */
+	private static function lookupNumbers(array $numbers, string $pattern, string $message): array {
+		$unique = [];
+		foreach ($numbers as $number) {
+			if (\is_int($number)) {
+				$number = (string)$number;
+			}
+			if (!\is_string($number) || !\preg_match($pattern, $number)) {
+				throw new \InvalidArgumentException($message);
+			}
+
+			$unique[(int)$number] = true;
+		}
+
+		return \array_keys($unique);
+	}
+
+	// ----------------------------------------------------------------
+	// Normalization
+	// ----------------------------------------------------------------
+
+	/**
+	 * Normalize one CVR_Virksomhed node.
+	 *
+	 * @param array<string,mixed> $node Raw company node.
+	 * @return CvrCompany Normalized company with productionUnits null.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the node shape or a value is invalid.
+	 */
+	private function normalizeCompany(array $node): array {
+		$cvrNumber = self::requiredInt($node['CVRNummer'] ?? null, 'company CVR number');
+		$entity = $this->normalizeEntity($node['id_CVR_CVREnhed_id_ref'] ?? null);
+
+		return [
+			'cvrNumber' => (string)$cvrNumber,
+			'name' => $entity['name'],
+			'status' => self::nullableString($node['status'] ?? null),
+			'startDate' => self::nullableString($node['virksomhedStartdato'] ?? null),
+			'endDate' => self::nullableString($node['virksomhedOphoersdato'] ?? null),
+			'companyType' => $this->normalizeCompanyType($node['id_CVR_Virksomhedsform_CVREnhedsId_ref'] ?? null),
+			'address' => $entity['address'],
+			'postalAddress' => $entity['postalAddress'],
+			'contact' => $entity['contact'],
+			'industries' => $entity['industries'],
+			'productionUnits' => null,
+		];
+	}
+
+	/**
+	 * Normalize one CVR_Produktionsenhed node.
+	 *
+	 * @param array<string,mixed> $node Raw production-unit node.
+	 * @return CvrProductionUnit Normalized production unit.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the node shape or a value is invalid.
+	 */
+	private function normalizeProductionUnit(array $node): array {
+		$pNumber = self::requiredInt($node['pNummer'] ?? null, 'production unit P-number');
+		$cvrNumber = self::requiredInt($node['tilknyttetVirksomhedsCVRNummer'] ?? null, 'production unit CVR number');
+		$entity = $this->normalizeEntity($node['id_CVR_CVREnhed_id_ref'] ?? null);
+
+		return [
+			'pNumber' => (string)$pNumber,
+			'cvrNumber' => (string)$cvrNumber,
+			'name' => $entity['name'],
+			'status' => self::nullableString($node['status'] ?? null),
+			'startDate' => self::nullableString($node['produktionsenhedStartdato'] ?? null),
+			'endDate' => self::nullableString($node['produktionsenhedOphoersdato'] ?? null),
+			'attachmentStartDate' => self::nullableString($node['tilknyttetTilVirksomhedStartdato'] ?? null),
+			'attachmentEndDate' => self::nullableString($node['tilknyttetTilVirksomhedOphoersdato'] ?? null),
+			'address' => $entity['address'],
+			'postalAddress' => $entity['postalAddress'],
+			'contact' => $entity['contact'],
+			'industries' => $entity['industries'],
+		];
+	}
+
+	/**
+	 * Normalize the name, addresses, contact data, and industries of one CVR entity relation.
+	 *
+	 * @param mixed $relation Raw CVR_CVREnhed connection.
+	 * @return CvrEntity Normalized entity data; every value is empty when the relation has no node.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the relation shape or a value is invalid.
+	 */
+	private function normalizeEntity(mixed $relation): array {
+		$entity = $this->firstConnectionNode($relation, 'CVR entity relation');
+		if ($entity === null) {
+			return [
+				'name' => null,
+				'address' => null,
+				'postalAddress' => null,
+				'contact' => [
+					'email' => null,
+					'phone' => null,
+					'marketingProtected' => null,
+				],
+				'industries' => [
+					'primary' => null,
+					'secondary' => [],
+				],
+			];
+		}
+
+		$nameRelation = $entity['id_CVR_Navn_CVREnhedsId_ref'] ?? null;
+		if ($nameRelation !== null && !\is_array($nameRelation)) {
+			throw new InvalidResponseException('CVR response contains an invalid name relation.');
+		}
+
+		$addresses = $this->normalizeAddresses($entity['id_CVR_Adressering_CVREnhedsId_ref'] ?? null);
+
+		return [
+			'name' => \is_array($nameRelation) ? self::nullableString($nameRelation['vaerdi'] ?? null) : null,
+			'address' => $addresses['address'],
+			'postalAddress' => $addresses['postalAddress'],
+			'contact' => [
+				'email' => $this->normalizeValueRelation($entity['id_CVR_e_mailadresse_CVREnhedsId_ref'] ?? null, 'email relation'),
+				'phone' => $this->normalizeValueRelation($entity['id_CVR_Telefonnummer_CVREnhedsId_ref'] ?? null, 'phone relation'),
+				'marketingProtected' => $this->normalizeBooleanValueRelation($entity['id_CVR_Reklamebeskyttelse_CVREnhedsId_ref'] ?? null),
+			],
+			'industries' => $this->normalizeIndustries($entity['id_CVR_Branche_CVREnhedsId_ref'] ?? null),
+		];
 	}
 
 	/**
@@ -311,42 +702,11 @@ GRAPHQL;
 	 *
 	 * Behavior:
 	 * - Keeps the explicit postal address separately when CVR supplies one.
-	 * - Preserves the historical public `address` behavior by falling back to the postal address
+	 * - Preserves the historical public address behavior by falling back to the postal address
 	 *   when no registered location address is available.
 	 *
 	 * @param mixed $relation Raw address relation.
-	 * @return array{
-	 *     address:array{
-	 *         type:?string,
-	 *         formatted:?string,
-	 *         careOf:?string,
-	 *         street:?string,
-	 *         houseNumberFrom:?string,
-	 *         houseNumberTo:?string,
-	 *         floor:?string,
-	 *         door:?string,
-	 *         postalCode:?string,
-	 *         city:?string,
-	 *         supplementaryCity:?string,
-	 *         countryCode:?string,
-	 *         freeText:?string
-	 *     }|null,
-	 *     postalAddress:array{
-	 *         type:?string,
-	 *         formatted:?string,
-	 *         careOf:?string,
-	 *         street:?string,
-	 *         houseNumberFrom:?string,
-	 *         houseNumberTo:?string,
-	 *         floor:?string,
-	 *         door:?string,
-	 *         postalCode:?string,
-	 *         city:?string,
-	 *         supplementaryCity:?string,
-	 *         countryCode:?string,
-	 *         freeText:?string
-	 *     }|null
-	 * } Normalized address set.
+	 * @return array{address:CvrAddress|null,postalAddress:CvrAddress|null} Normalized address set.
 	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the relation shape is invalid.
 	 */
 	private function normalizeAddresses(mixed $relation): array {
@@ -387,21 +747,7 @@ GRAPHQL;
 	 * Normalize one CVR address node.
 	 *
 	 * @param array<string,mixed> $node Raw address node.
-	 * @return array{
-	 *     type:?string,
-	 *     formatted:?string,
-	 *     careOf:?string,
-	 *     street:?string,
-	 *     houseNumberFrom:?string,
-	 *     houseNumberTo:?string,
-	 *     floor:?string,
-	 *     door:?string,
-	 *     postalCode:?string,
-	 *     city:?string,
-	 *     supplementaryCity:?string,
-	 *     countryCode:?string,
-	 *     freeText:?string
-	 * } Normalized address.
+	 * @return CvrAddress Normalized address.
 	 */
 	private function normalizeAddressNode(array $node): array {
 		$address = [
@@ -434,24 +780,10 @@ GRAPHQL;
 	 * - Omits the Danish country code but appends non-Danish country codes when present.
 	 *
 	 * Notes:
-	 * - The upstream `Adresse` field is a DAR address reference, not formatted address text.
+	 * - The upstream Adresse field is a DAR address reference, not formatted address text.
 	 * - No external address lookup is required.
 	 *
-	 * @param array{
-	 *     type:?string,
-	 *     formatted:?string,
-	 *     careOf:?string,
-	 *     street:?string,
-	 *     houseNumberFrom:?string,
-	 *     houseNumberTo:?string,
-	 *     floor:?string,
-	 *     door:?string,
-	 *     postalCode:?string,
-	 *     city:?string,
-	 *     supplementaryCity:?string,
-	 *     countryCode:?string,
-	 *     freeText:?string
-	 * } $address Normalized CVR address fields.
+	 * @param CvrAddress $address Normalized CVR address fields.
 	 * @return string|null Single-line display address, or null when no address text can be built.
 	 */
 	private static function formatAddress(array $address): ?string {
@@ -571,10 +903,7 @@ GRAPHQL;
 	 * - Results are sorted by sequence so the public output is deterministic.
 	 *
 	 * @param mixed $relation Raw branch connection.
-	 * @return array{
-	 *     primary:array{code:string,name:string,sequence:int}|null,
-	 *     secondary:list<array{code:string,name:string,sequence:int}>
-	 * } Normalized industries.
+	 * @return CvrIndustries Normalized industries.
 	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the relation shape or node values are invalid.
 	 */
 	private function normalizeIndustries(mixed $relation): array {
@@ -657,6 +986,10 @@ GRAPHQL;
 			'name' => self::nullableString($relation['vaerdiTekst'] ?? null),
 		];
 	}
+
+	// ----------------------------------------------------------------
+	// Scalar values
+	// ----------------------------------------------------------------
 
 	/**
 	 * Normalize a required upstream scalar to a non-empty string.

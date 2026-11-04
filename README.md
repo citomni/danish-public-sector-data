@@ -161,10 +161,11 @@ The local normalization/query-contract test does not make network requests:
 php tests/soil_contamination_test.php
 ```
 
-## CVR company lookup
+## CVR lookups
 
-The public CVR service intentionally returns a normalized package-owned array
-rather than Datafordeler-specific GraphQL relation names.
+The public CVR service looks up companies by CVR number and production units (P-enheder)
+by P-number, one number at a time or many per call. It intentionally returns normalized
+package-owned arrays rather than Datafordeler-specific GraphQL relation names.
 
 ```php
 $company = $this->app->cvr->getCompany('12345678');
@@ -172,9 +173,59 @@ $company = $this->app->cvr->getCompany('12345678');
 if ($company === null) {
 	// No matching CVR company exists.
 }
+
+$company = $this->app->cvr->getCompany('12345678', withProductionUnits: true);
+$companies = $this->app->cvr->getCompanies(['12345678', '87654321'], withProductionUnits: true);
+$unit = $this->app->cvr->getProductionUnit('1234567890');
+$units = $this->app->cvr->getProductionUnits(['1234567890', '1234567891']);
 ```
 
-Result shape:
+With `withProductionUnits: true`, a company record lists the company's production units in
+`productionUnits`, ordered by P-number: the units that Datafordeler attaches to the company
+at the time of the call. The service does not filter them by status or end date. Without
+it, `productionUnits` is `null` and no production-unit request is sent, so a lookup that
+only needs the company itself, such as filling in a form from a CVR number, stays at one
+request.
+
+A production-unit record names its company in `cvrNumber`. Both kinds of record carry
+their own name, addresses, contact data and industries. The companies of some production
+units are one more call:
+
+```php
+$owners = $this->app->cvr->getCompanies(\array_column($units, 'cvrNumber'));
+```
+
+`getCompanies()` and `getProductionUnits()` return one entry per distinct number, keyed by
+the number in the order the numbers first occur, and `null` for a number that Datafordeler
+does not know. PHP stores these numeric keys as integers, so `$companies['12345678']` and
+`$companies[12345678]` read the same entry, and the keys can be passed back in: numbers
+are accepted as strings or ints.
+
+### Requests
+
+Datafordeler accepts at most 100 values in one `in` filter and returns at most 1000 rows
+per page. The service sends one root query per request, batches the numbers 100 at a time,
+and requests pages until Datafordeler reports no further page. With one row per company
+and production unit, a call takes these requests:
+
+| Call | Requests |
+|---|---|
+| `getCompany()` | 1 |
+| `getCompany(..., withProductionUnits: true)` | 1, plus 1 per started 1000 production units (at least 1) when the company exists |
+| `getCompanies()` | 1 per 100 distinct numbers |
+| `getCompanies(..., withProductionUnits: true)` | Per 100 distinct numbers: 1, plus 1 per started 1000 production units (at least 1) of the companies found |
+| `getProductionUnit()` | 1 |
+| `getProductionUnits()` | 1 per 100 distinct numbers |
+
+The production units of a company are selected by the company's CVR number rather than by
+P-number, so a company with 1,323 production units takes three requests, full
+production-unit records included. Every request of one call uses the same effect time
+(`virkningstid`): the time of the call. A page of production units is normalized before
+the next page is requested, so only one raw page is held in memory at a time.
+
+### Result shapes
+
+Company:
 
 ```php
 [
@@ -216,23 +267,68 @@ Result shape:
 		],
 		'secondary' => [],
 	],
+	'productionUnits' => [
+		// Production-unit records, as below.
+	],
 ]
 ```
 
-`getCompany()` requires exactly eight CVR digits and returns `null` when the
-upstream query returns no company node. Integration failures throw exceptions
-from `CitOmni\DanishPublicSectorData\Exception`. The `address.formatted` value is
-built locally from the normalized CVR address fields; Datafordeler's upstream
-`Adresse` value is a DAR address reference rather than formatted display text.
+Production unit:
+
+```php
+[
+	'pNumber' => '1234567890',
+	'cvrNumber' => '12345678',
+	'name' => 'Example ApS',
+	'status' => 'aktiv',
+	'startDate' => '2020-01-01',
+	'endDate' => null,
+	'attachmentStartDate' => '2020-01-01',
+	'attachmentEndDate' => null,
+	'address' => [
+		// Same shape as the company address.
+	],
+	'postalAddress' => null,
+	'contact' => [
+		'email' => 'info@example.test',
+		'phone' => '12345678',
+		'marketingProtected' => false,
+	],
+	'industries' => [
+		// Same shape as the company industries.
+	],
+]
+```
+
+`startDate` and `endDate` of a production unit are the unit's own start and end;
+`attachmentStartDate` and `attachmentEndDate` bound its attachment to the company in
+`cvrNumber`.
+
+CVR numbers must have eight digits and P-numbers ten digits, neither starting with `0`,
+as a string or an int; any other value throws `\InvalidArgumentException` before a request
+is sent. A lookup
+returns `null` when the upstream query returns no node for the number. Integration
+failures throw exceptions from `CitOmni\DanishPublicSectorData\Exception`. The
+`address.formatted` value is built locally from the normalized CVR address fields;
+Datafordeler's upstream `Adresse` value is a DAR address reference rather than formatted
+display text.
 
 `address` continues to prefer the registered location address and falls back to the
 postal address for backwards-compatible lookup behavior. `postalAddress` exposes the
 postal address explicitly when CVR supplies one. Industry sequence `0` is normalized as
 the primary industry; sequences `1` through `3` are returned as secondary industries.
 
-The normalized `getCompany()` contract intentionally remains limited to fields exposed by
-the selected Datafordeler GraphQL contract. Source-specific payloads are not part of
-`getCompany()` and must not leak into application persistence contracts.
+The normalized CVR records intentionally remain limited to fields exposed by the selected
+Datafordeler GraphQL contract. Source-specific payloads are not part of them and must not
+leak into application persistence contracts.
+
+The local test checks the requests, batching, pagination and normalization against
+scripted responses, and every query document against the bundled flexibleCurrent v3
+schema, without network requests:
+
+```bash
+php tests/cvr_lookup_test.php
+```
 
 The current default uses Datafordeler `flexibleCurrent/v3`. Host applications can
 override the endpoint selection through the normal CitOmni configuration flow:
