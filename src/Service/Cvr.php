@@ -29,6 +29,8 @@ use CitOmni\Kernel\Service\BaseService;
  *   and production units alike, plus the company form for companies.
  * - Returns a company with its production units when the caller asks for them, and a
  *   production unit with the CVR number of its company.
+ * - Returns the latest number of employees of companies and production units through calls of
+ *   their own, which read only the employment figures.
  * - Prefers the registered location address and keeps the explicit postal address separately.
  * - Returns null for a number without a matching company or production unit.
  *
@@ -93,6 +95,13 @@ use CitOmni\Kernel\Service\BaseService;
  *     industries:CvrIndustries,
  *     productionUnits:list<CvrProductionUnit>|null
  * }
+ * @phpstan-type CvrEmployees array{
+ *     count:?int,
+ *     intervalFrom:?int,
+ *     intervalTo:?int,
+ *     periodStart:string,
+ *     periodEnd:string
+ * }
  *
  * @throws \InvalidArgumentException When a CVR number or P-number is malformed.
  * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When the remote lookup fails.
@@ -102,7 +111,7 @@ final class Cvr extends BaseService {
 	/** Maximum number of identifiers in one in filter, and the page size of a lookup by identifiers. */
 	private const int IDENTIFIER_BATCH_SIZE = 100; // Datafordeler accepts at most 100 values in an in filter.
 
-	/** Page size of the production units of a batch of companies. */
+	/** Page size of the production units of a batch of companies, and of the employment figures of a batch of entities. */
 	private const int PAGE_SIZE = 1000; // Largest page Datafordeler serves.
 
 	/** CVR number accepted for lookup: eight digits, the first of them 1-9. */
@@ -110,6 +119,9 @@ final class Cvr extends BaseService {
 
 	/** P-number accepted for lookup: ten digits, the first of them 1-9. */
 	private const string P_NUMBER_PATTERN = '/^[1-9][0-9]{9}$/D'; // Numbers become GraphQL Long literals, which cannot start with 0.
+
+	/** Part of the employment type of every figure that counts employees. */
+	private const string EMPLOYEE_COUNT_TYPE = 'AntalAnsatte'; // Assumes that the types that count persons contain this, as AarsbeskaeftigelseAntalAnsatte does, and that the types that count full-time equivalents (AntalAarsvaerk) do not.
 
 	/** GraphQL selection of the name, address, industry, and contact relations of one CVR entity. */
 	private const string ENTITY_SELECTION = <<<'GRAPHQL'
@@ -374,6 +386,149 @@ GRAPHQL;
 		return $units;
 	}
 
+	/**
+	 * Return the latest number of employees of many companies.
+	 *
+	 * Behavior:
+	 * - Returns one entry per distinct CVR number, keyed by that number in the order the numbers
+	 *   first occur. An entry is null when Datafordeler has no company with the number, or none
+	 *   of the company's employment figures counts employees.
+	 * - Sends the numbers in batches of up to 100. A batch takes one request per page of up to
+	 *   100 companies and, with at least one company found, one request per page of up to 1000
+	 *   employment figures of the companies found.
+	 * - Every request of one call uses the same effect time: the time of the call.
+	 *
+	 * Typical usage:
+	 *   $employees = $this->app->cvr->getCompanyEmployees(['12345678', '87654321']);
+	 *
+	 * @param array<array-key,int|string> $cvrNumbers CVR numbers of eight digits, the first of them 1-9. A repeated number is looked up once.
+	 * @return array<int,CvrEmployees|null> Latest employee figure keyed by CVR number.
+	 * @throws \InvalidArgumentException When a CVR number is not an int or string of eight digits starting with 1-9.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When a remote lookup fails or is malformed.
+	 * @see \CitOmni\DanishPublicSectorData\Service\Cvr::getProductionUnitEmployees() Which figure is the latest, and what it holds.
+	 */
+	public function getCompanyEmployees(array $cvrNumbers): array {
+		return $this->employees(
+			'CVR_Virksomhed',
+			'CVRNummer',
+			self::lookupNumbers(
+				$cvrNumbers,
+				self::CVR_NUMBER_PATTERN,
+				'CVR number must be an int or a string of exactly eight digits, the first of them 1-9.'
+			)
+		);
+	}
+
+	/**
+	 * Return the latest number of employees of many production units.
+	 *
+	 * Behavior:
+	 * - Returns one entry per distinct P-number, keyed by that number in the order the numbers
+	 *   first occur. An entry is null when Datafordeler has no production unit with the number,
+	 *   or none of the unit's employment figures counts employees.
+	 * - The entry is the latest figure that counts employees, as opposed to full-time
+	 *   equivalents: The one whose period ends last. Of periods that end on the same day, the
+	 *   shortest wins, then an exact count over an interval, then the latest registration.
+	 * - count holds the exact number when Datafordeler has one. Otherwise count is null, and
+	 *   intervalFrom and intervalTo hold the bounds that Datafordeler gives. periodStart and
+	 *   periodEnd bound the period that the figure covers, as YYYY-MM-DD.
+	 * - Sends the numbers in batches of up to 100. A batch takes one request per page of up to
+	 *   100 production units and, with at least one unit found, one request per page of up to
+	 *   1000 employment figures of the units found.
+	 * - Every request of one call uses the same effect time: the time of the call.
+	 *
+	 * Notes:
+	 * - Datafordeler cannot filter employment figures by type or period, so every figure of an
+	 *   entity is requested, its whole history included, and the latest is chosen here.
+	 *
+	 * Typical usage:
+	 *   $employees = $this->app->cvr->getProductionUnitEmployees(['1234567890', '1234567891']);
+	 *
+	 * @param array<array-key,int|string> $pNumbers P-numbers of ten digits, the first of them 1-9. A repeated number is looked up once.
+	 * @return array<int,CvrEmployees|null> Latest employee figure keyed by P-number.
+	 * @throws \InvalidArgumentException When a P-number is not an int or string of ten digits starting with 1-9.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When a remote lookup fails or is malformed.
+	 */
+	public function getProductionUnitEmployees(array $pNumbers): array {
+		return $this->employees(
+			'CVR_Produktionsenhed',
+			'pNummer',
+			self::lookupNumbers(
+				$pNumbers,
+				self::P_NUMBER_PATTERN,
+				'P-number must be an int or a string of exactly ten digits, the first of them 1-9.'
+			)
+		);
+	}
+
+	/**
+	 * Return the latest employee figure of every requested company or production unit.
+	 *
+	 * @param string $root CVR_Virksomhed or CVR_Produktionsenhed.
+	 * @param string $numberField CVRNummer or pNummer: The field of the root type that holds the requested numbers.
+	 * @param list<int> $requested Distinct, validated numbers.
+	 * @return array<int,CvrEmployees|null> Latest figure keyed by number, in the order of $requested.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When a remote lookup fails or is malformed.
+	 * @see \CitOmni\DanishPublicSectorData\Service\Cvr::getProductionUnitEmployees() Which figure is the latest.
+	 */
+	private function employees(string $root, string $numberField, array $requested): array {
+		if ($requested === []) {
+			return [];
+		}
+
+		$effectiveAt = \gmdate('Y-m-d\\TH:i:s\\Z');
+		$employees = \array_fill_keys($requested, null);
+
+		foreach (\array_chunk($requested, self::IDENTIFIER_BATCH_SIZE) as $batch) {
+			// -- 1. Find the CVR entity of every number ------------------------
+			$expected = \array_flip($batch);
+			$numbersById = [];
+
+			$nodes = $this->connectionNodes(
+				$root,
+				static fn(?string $after): string => self::entityIdsQuery($root, $numberField, $batch, $effectiveAt, $after)
+			);
+			foreach ($nodes as $node) {
+				$number = self::requiredInt($node[$numberField] ?? null, $numberField);
+				if (!isset($expected[$number])) {
+					throw new InvalidResponseException('CVR response contains an unexpected ' . $numberField . '.');
+				}
+
+				// One row per number is expected at one effect time; the first row wins over a repeat.
+				$numbersById[self::requiredString($node['id'] ?? null, 'CVR entity id')] ??= $number;
+			}
+
+			if ($numbersById === []) {
+				continue;
+			}
+
+			// -- 2. Keep the latest employee figure of each entity -------------
+			// PHP turns numeric ids into int keys; the filter takes them as strings.
+			$entityIds = \array_map('strval', \array_keys($numbersById));
+			$latest = [];
+
+			$nodes = $this->connectionNodes(
+				'CVR_Beskaeftigelse',
+				static fn(?string $after): string => self::employmentQuery($entityIds, $effectiveAt, $after)
+			);
+			foreach ($nodes as $node) {
+				$entityId = self::requiredString($node['CVREnhedsId'] ?? null, 'employment entity id');
+				$number = $numbersById[$entityId] ?? throw new InvalidResponseException('CVR response contains an employment figure of an unexpected entity.');
+
+				$figure = self::employeeFigure($node);
+				if ($figure !== null && (!isset($latest[$number]) || $figure['rank'] > $latest[$number]['rank'])) {
+					$latest[$number] = $figure;
+				}
+			}
+
+			foreach ($latest as $number => $figure) {
+				$employees[$number] = $figure['employees'];
+			}
+		}
+
+		return $employees;
+	}
+
 	// ----------------------------------------------------------------
 	// Requests
 	// ----------------------------------------------------------------
@@ -511,6 +666,85 @@ query CvrProductionUnits {
 {$entity}
 				}
 			}
+		}
+		pageInfo {
+			hasNextPage
+			endCursor
+		}
+	}
+}
+GRAPHQL;
+	}
+
+	/**
+	 * Build the query document for one page of the CVR entity ids of companies or production units.
+	 *
+	 * @param string $root CVR_Virksomhed or CVR_Produktionsenhed.
+	 * @param string $numberField CVRNummer or pNummer: The field of the root type that holds the numbers.
+	 * @param list<int> $numbers At most 100 numbers.
+	 * @param string $effectiveAt UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param string|null $after Cursor of the previous page, or null for the first page.
+	 * @return string GraphQL query document.
+	 */
+	private static function entityIdsQuery(string $root, string $numberField, array $numbers, string $effectiveAt, ?string $after): string {
+		$first = self::IDENTIFIER_BATCH_SIZE;
+		$afterArgument = self::afterArgument($after);
+		$numberList = \implode(', ', $numbers);
+
+		return <<<GRAPHQL
+query CvrEntityIds {
+	{$root}(
+		first: {$first}{$afterArgument}
+		virkningstid: "{$effectiveAt}"
+		where: { {$numberField}: { in: [{$numberList}] } }
+	) {
+		nodes {
+			{$numberField}
+			id
+		}
+		pageInfo {
+			hasNextPage
+			endCursor
+		}
+	}
+}
+GRAPHQL;
+	}
+
+	/**
+	 * Build the query document for one page of the employment figures of CVR entities.
+	 *
+	 * @param list<string> $entityIds At most 100 CVR entity ids.
+	 * @param string $effectiveAt UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param string|null $after Cursor of the previous page, or null for the first page.
+	 * @return string GraphQL query document.
+	 */
+	private static function employmentQuery(array $entityIds, string $effectiveAt, ?string $after): string {
+		$first = self::PAGE_SIZE;
+		$afterArgument = self::afterArgument($after);
+
+		// The ids come from Datafordeler. A JSON string literal is also a valid GraphQL string literal.
+		$idList = \implode(', ', \array_map(
+			static fn(string $entityId): string => \json_encode($entityId, \JSON_THROW_ON_ERROR | \JSON_UNESCAPED_SLASHES | \JSON_UNESCAPED_UNICODE),
+			$entityIds
+		));
+
+		return <<<GRAPHQL
+query CvrEmployment {
+	CVR_Beskaeftigelse(
+		first: {$first}{$afterArgument}
+		virkningstid: "{$effectiveAt}"
+		where: { CVREnhedsId: { in: [{$idList}] } }
+	) {
+		nodes {
+			CVREnhedsId
+			beskaeftigelsestalstype
+			antal
+			intervalFra
+			intervalTil
+			datoFra
+			datoTil
+			registreringsdato
 		}
 		pageInfo {
 			hasNextPage
@@ -987,6 +1221,61 @@ GRAPHQL;
 		];
 	}
 
+	/**
+	 * Normalize one CVR_Beskaeftigelse node when it counts employees.
+	 *
+	 * Behavior:
+	 * - rank orders two figures of one entity: The greater rank is the later figure, as
+	 *   getProductionUnitEmployees() defines it. Figures that would tie are ordered by their
+	 *   values, so the choice does not depend on the order of the response.
+	 *
+	 * @param array<string,mixed> $node Raw employment node.
+	 * @return array{rank:list<int|string>,employees:CvrEmployees}|null Normalized figure and its rank, or null when the figure counts something else, such as full-time equivalents, or holds no number.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the type is missing, or a value of a figure that counts employees is invalid.
+	 */
+	private static function employeeFigure(array $node): ?array {
+		$type = self::requiredString($node['beskaeftigelsestalstype'] ?? null, 'employment type');
+		if (!\str_contains($type, self::EMPLOYEE_COUNT_TYPE)) {
+			return null;
+		}
+
+		$count = self::nullableCount($node['antal'] ?? null, 'employee count');
+		$intervalFrom = self::nullableCount($node['intervalFra'] ?? null, 'employee interval start');
+		$intervalTo = self::nullableCount($node['intervalTil'] ?? null, 'employee interval end');
+		if ($count === null && $intervalFrom === null) {
+			return null;
+		}
+		if ($intervalFrom !== null && $intervalTo !== null && $intervalFrom > $intervalTo) {
+			throw new InvalidResponseException('CVR response contains an employee interval that ends before it starts.');
+		}
+
+		$periodStart = self::requiredDate($node['datoFra'] ?? null, 'employment period start');
+		$periodEnd = self::requiredDate($node['datoTil'] ?? null, 'employment period end');
+		if ($periodStart > $periodEnd) {
+			throw new InvalidResponseException('CVR response contains an employment period that ends before it starts.');
+		}
+
+		return [
+			'rank' => [
+				$periodEnd,
+				$periodStart,
+				$count === null ? 0 : 1,
+				self::utcTime($node['registreringsdato'] ?? null, 'employment registration time'),
+				$count ?? -1,
+				$intervalFrom ?? -1,
+				$intervalTo ?? -1,
+				$type,
+			],
+			'employees' => [
+				'count' => $count,
+				'intervalFrom' => $intervalFrom,
+				'intervalTo' => $intervalTo,
+				'periodStart' => $periodStart,
+				'periodEnd' => $periodEnd,
+			],
+		];
+	}
+
 	// ----------------------------------------------------------------
 	// Scalar values
 	// ----------------------------------------------------------------
@@ -1043,5 +1332,69 @@ GRAPHQL;
 		}
 
 		return (string)$value;
+	}
+
+	/**
+	 * Normalize a nullable upstream count.
+	 *
+	 * @param mixed $value Raw upstream value.
+	 * @param string $label Safe value label for diagnostics.
+	 * @return int|null Count of at least 0, or null when the value is null.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the value is neither null nor an integer of at least 0.
+	 */
+	private static function nullableCount(mixed $value, string $label): ?int {
+		if ($value === null) {
+			return null;
+		}
+
+		$count = self::requiredInt($value, $label);
+		if ($count < 0) {
+			throw new InvalidResponseException('CVR response contains a negative ' . $label . '.');
+		}
+
+		return $count;
+	}
+
+	/**
+	 * Normalize a required upstream date.
+	 *
+	 * @param mixed $value Raw upstream value.
+	 * @param string $label Safe value label for diagnostics.
+	 * @return string Date that exists, as YYYY-MM-DD.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the value is not a date that exists, written as YYYY-MM-DD.
+	 */
+	private static function requiredDate(mixed $value, string $label): string {
+		if (
+			!\is_string($value)
+			|| \preg_match('/^(\d{4})-(\d{2})-(\d{2})$/D', $value, $match) !== 1
+			|| !\checkdate((int)$match[2], (int)$match[3], (int)$match[1])
+		) {
+			throw new InvalidResponseException('CVR response contains an invalid ' . $label . '.');
+		}
+
+		return $value;
+	}
+
+	/**
+	 * Normalize a required upstream timestamp to UTC text that sorts in time order.
+	 *
+	 * @param mixed $value Raw upstream value, such as 2026-03-31T09:23:30.000000+02:00.
+	 * @param string $label Safe value label for diagnostics.
+	 * @return string The time in UTC, as Y-m-d H:i:s.u.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the value is missing or not a time.
+	 */
+	private static function utcTime(mixed $value, string $label): string {
+		if (!\is_string($value) || $value === '') {
+			throw new InvalidResponseException('CVR response contains a missing ' . $label . '.');
+		}
+
+		try {
+			$time = new \DateTimeImmutable($value);
+		} catch (\DateMalformedStringException) {
+			throw new InvalidResponseException('CVR response contains an invalid ' . $label . '.');
+		}
+
+		// Offsets differ across daylight saving time, so only UTC text sorts in time order.
+		return $time->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d H:i:s.u');
 	}
 }

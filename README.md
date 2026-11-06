@@ -201,6 +201,46 @@ does not know. PHP stores these numeric keys as integers, so `$companies['123456
 `$companies[12345678]` read the same entry, and the keys can be passed back in: numbers
 are accepted as strings or ints.
 
+### Employees
+
+The latest number of employees of companies and production units comes from calls of its
+own, which read only the CVR entity ids and the employment figures:
+
+```php
+$unitEmployees = $this->app->cvr->getProductionUnitEmployees(['1234567890', '1234567891']);
+$companyEmployees = $this->app->cvr->getCompanyEmployees(['12345678', '87654321']);
+```
+
+They return one entry per distinct number, keyed like `getProductionUnits()` and
+`getCompanies()`:
+
+```php
+[
+	'count' => 14,
+	'intervalFrom' => null,
+	'intervalTo' => null,
+	'periodStart' => '2026-08-01',
+	'periodEnd' => '2026-08-31',
+]
+```
+
+- The service counts a figure as employees when its type (`beskaeftigelsestalstype`)
+  contains `AntalAnsatte`, and leaves out the others, such as full-time equivalents
+  (`AntalAarsvaerk`).
+- Of those, the entry is the figure whose period ends last. Of periods that end on the same
+  day, the shortest wins, so a month comes before the quarter and the year that end with
+  it; then an exact count before an interval; then the latest registration.
+- `count` is the exact number when Datafordeler has one. Otherwise it is `null`, and
+  `intervalFrom` and `intervalTo` hold the bounds that Datafordeler gives.
+- An entry is `null` when Datafordeler does not know the number, or has no figure of
+  employees for it.
+- The latest figure can be old: A company without employees for years keeps its last
+  figure. `periodEnd` shows its age; the service returns it whatever its age.
+
+Datafordeler cannot filter employment figures by type or period, so the service requests
+every figure of each company or production unit, its whole history included, and chooses
+the latest itself.
+
 ### Requests
 
 Datafordeler accepts at most 100 values in one `in` filter and returns at most 1000 rows
@@ -216,6 +256,8 @@ and production unit, a call takes these requests:
 | `getCompanies(..., withProductionUnits: true)` | Per 100 distinct numbers: 1, plus 1 per started 1000 production units (at least 1) of the companies found |
 | `getProductionUnit()` | 1 |
 | `getProductionUnits()` | 1 per 100 distinct numbers |
+| `getCompanyEmployees()` | Per 100 distinct numbers: 1, plus 1 per started 1000 employment figures (at least 1) of the companies found |
+| `getProductionUnitEmployees()` | Per 100 distinct numbers: 1, plus 1 per started 1000 employment figures (at least 1) of the production units found |
 
 The production units of a company are selected by the company's CVR number rather than by
 P-number, so a company with 1,323 production units takes three requests, full
@@ -322,9 +364,9 @@ The normalized CVR records intentionally remain limited to fields exposed by the
 Datafordeler GraphQL contract. Source-specific payloads are not part of them and must not
 leak into application persistence contracts.
 
-The local test checks the requests, batching, pagination and normalization against
-scripted responses, and every query document against the bundled flexibleCurrent v3
-schema, without network requests:
+The local test checks the requests, batching, pagination, normalization and the choice of
+the latest employee figure against scripted responses, and every query document against
+the bundled flexibleCurrent v3 schema, without network requests:
 
 ```bash
 php tests/cvr_lookup_test.php

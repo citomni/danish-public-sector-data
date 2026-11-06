@@ -14,8 +14,8 @@ declare(strict_types=1);
  */
 
 /*
- * CVR lookups: the requests the Cvr service sends and the records it returns, against a
- * scripted transport. No network request is made.
+ * CVR lookups: the requests the Cvr service sends, and the records and employee figures it
+ * returns, against a scripted transport. No network request is made.
  *
  * This provider package intentionally has no package-local Composer vendor tree. The test
  * therefore supplies minimal doubles of the CitOmni App and BaseService contracts and runs the
@@ -298,6 +298,14 @@ namespace {
 		return \array_map('intval', \explode(', ', $match[1]));
 	};
 	$effectTime = static fn(string $query): ?string => \preg_match('/virkningstid: "([^"]+)"/', $query, $match) ? $match[1] : null;
+	$idsIn = static function (string $query): array {
+		if (!\preg_match('/where: \{ CVREnhedsId: \{ in: \[(.*)\] \} \}/', $query, $match)) {
+			return [];
+		}
+
+		// A bare number in the list decodes as an int, so a strict comparison catches an id sent as a number.
+		return \json_decode('[' . $match[1] . ']', true, 512, \JSON_THROW_ON_ERROR);
+	};
 
 	$entity = static fn(string $name, array $relations = []): array => [
 		'nodes' => [
@@ -349,9 +357,30 @@ namespace {
 			'pageInfo' => ['hasNextPage' => $endCursor !== null, 'endCursor' => $endCursor],
 		],
 	];
+	$idNode = static fn(string $numberField, int $number, ?string $entityId): array => [$numberField => $number, 'id' => $entityId];
+	$figure = static fn(
+		string $entityId,
+		string $type,
+		?int $count,
+		string $periodStart,
+		string $periodEnd,
+		?int $intervalFrom = null,
+		?int $intervalTo = null,
+		string $registeredAt = '2026-01-10T08:00:00.000000+01:00'
+	): array => [
+		'CVREnhedsId' => $entityId,
+		'beskaeftigelsestalstype' => $type,
+		'antal' => $count,
+		'intervalFra' => $intervalFrom,
+		'intervalTil' => $intervalTo,
+		'datoFra' => $periodStart,
+		'datoTil' => $periodEnd,
+		'registreringsdato' => $registeredAt,
+	];
 
 	$companyKeys = ['cvrNumber', 'name', 'status', 'startDate', 'endDate', 'companyType', 'address', 'postalAddress', 'contact', 'industries', 'productionUnits'];
 	$unitKeys = ['pNumber', 'cvrNumber', 'name', 'status', 'startDate', 'endDate', 'attachmentStartDate', 'attachmentEndDate', 'address', 'postalAddress', 'contact', 'industries'];
+	$employeeKeys = ['count', 'intervalFrom', 'intervalTo', 'periodStart', 'periodEnd'];
 
 	// ----------------------------------------------------------------
 	// Cases
@@ -569,7 +598,153 @@ namespace {
 	$script([['CVR_Produktionsenhed' => ['nodes' => [$unit(1024552248, 40386270, 'A')]]]]);
 	$throws(static fn() => $cvr->getProductionUnit('1024552248'), InvalidResponseException::class, 'A connection without pageInfo is rejected.');
 
-	// -- 10. Query documents against the bundled schema --------------------------
+	// -- 10. Employees of production units -------------------------------------
+	$script([
+		$page('CVR_Produktionsenhed', [
+			$idNode('pNummer', 1024552248, '4006724884'),
+			$idNode('pNummer', 1024552249, 'unit-b'),
+		]),
+		$page('CVR_Beskaeftigelse', [
+			$figure('4006724884', 'AarsbeskaeftigelseAntalAnsatte', 12, '2025-01-01', '2025-12-31'),
+			$figure('4006724884', 'MaanedsbeskaeftigelseAntalAnsatte', 14, '2026-08-01', '2026-08-31'),
+			$figure('4006724884', 'MaanedsbeskaeftigelseAntalAarsvaerk', 11, '2026-09-01', '2026-09-30'),
+			$figure('4006724884', 'KvartalsbeskaeftigelseAntalAnsatte', 13, '2026-04-01', '2026-06-30'),
+			$figure('unit-b', 'KvartalsbeskaeftigelseAntalAnsatteInterval', null, '2026-04-01', '2026-06-30', 10, 19),
+			$figure('unit-b', 'AarsbeskaeftigelseAntalAnsatte', 9, '2024-01-01', '2024-12-31'),
+		]),
+	]);
+	$result = $cvr->getProductionUnitEmployees(['1024552248', '1999999999', '1024552249', '1024552248']);
+	$sent = $queries();
+	$check(\count($sent) === 2, 'One batch of production units takes one id request and one employment request.');
+	$check(
+		\str_contains($sent[0], 'CVR_Produktionsenhed(') && $numbersIn($sent[0]) === [1024552248, 1999999999, 1024552249] && $pageSize($sent[0]) === 100,
+		'The id request filters on the distinct P-numbers and pages by the batch size.'
+	);
+	$check(!\str_contains($sent[0], '_ref'), 'The id request joins nothing.');
+	$check(
+		\str_contains($sent[1], 'CVR_Beskaeftigelse(') && $idsIn($sent[1]) === ['4006724884', 'unit-b'] && $pageSize($sent[1]) === 1000,
+		'The employment request filters on the entity ids as strings, a numeric one included, and pages by the largest page.'
+	);
+	$check($effectTime($sent[0]) !== null && $effectTime($sent[0]) === $effectTime($sent[1]), 'Both requests of one call use the same effect time.');
+	$check(\array_keys($result) === [1024552248, 1999999999, 1024552249], 'Results are keyed by P-number in input order, and repeats collapse.');
+	$check($result[1999999999] === null, 'An unknown P-number has no figure.');
+	$check(\array_keys($result[1024552248]) === $employeeKeys, 'A figure has the documented keys in order.');
+	$check(
+		$result[1024552248] === ['count' => 14, 'intervalFrom' => null, 'intervalTo' => null, 'periodStart' => '2026-08-01', 'periodEnd' => '2026-08-31'],
+		'The figure that counts employees and ends last wins; a later figure of full-time equivalents is left out.'
+	);
+	$check(
+		$result[1024552249] === ['count' => null, 'intervalFrom' => 10, 'intervalTo' => 19, 'periodStart' => '2026-04-01', 'periodEnd' => '2026-06-30'],
+		'A latest figure with only an interval keeps its bounds and a null count.'
+	);
+
+	$script([
+		$page('CVR_Produktionsenhed', [$idNode('pNummer', 1024552248, 'unit-a')]),
+		$page('CVR_Beskaeftigelse', [$figure('unit-a', 'AarsbeskaeftigelseAntalAnsatte', 3, '2023-01-01', '2023-12-31')], 'figure-cursor-1'),
+		$page('CVR_Beskaeftigelse', [$figure('unit-a', 'AarsbeskaeftigelseAntalAnsatte', 4, '2024-01-01', '2024-12-31')]),
+	]);
+	$result = $cvr->getProductionUnitEmployees([1024552248]);
+	$sent = $queries();
+	$check(\count($sent) === 3 && \str_contains($sent[2], 'CVR_Beskaeftigelse(') && \str_contains($sent[2], 'after: "figure-cursor-1"'), 'The next page of figures continues from the returned cursor.');
+	$check($result[1024552248]['count'] === 4, 'The figures of every page are compared.');
+
+	$script([
+		$page('CVR_Produktionsenhed', [$idNode('pNummer', 1024552248, 'unit-a')]),
+		$page('CVR_Beskaeftigelse', [
+			$figure('unit-a', 'AarsbeskaeftigelseAntalAarsvaerk', 3, '2024-01-01', '2024-12-31'),
+			$figure('unit-a', 'AarsbeskaeftigelseAntalAnsatte', null, '2024-01-01', '2024-12-31'),
+		]),
+	]);
+	$check($cvr->getProductionUnitEmployees(['1024552248']) === [1024552248 => null], 'A unit whose figures count no employees, or hold no number, has no figure.');
+
+	$numbers = \array_map('strval', \range(1000000000, 1000000100));
+	$script([
+		$page('CVR_Produktionsenhed', []),
+		$page('CVR_Produktionsenhed', [$idNode('pNummer', 1000000100, 'unit-last')]),
+		$page('CVR_Beskaeftigelse', [$figure('unit-last', 'AarsbeskaeftigelseAntalAnsatte', 2, '2025-01-01', '2025-12-31')]),
+	]);
+	$result = $cvr->getProductionUnitEmployees($numbers);
+	$sent = $queries();
+	$check(
+		\count($sent) === 3 && \count($numbersIn($sent[0])) === 100 && $numbersIn($sent[1]) === [1000000100] && \str_contains($sent[2], 'CVR_Beskaeftigelse('),
+		'101 P-numbers take two id requests, and only the batch with a unit found takes an employment request.'
+	);
+	$check(\count($result) === 101 && $result[1000000000] === null && $result[1000000100]['count'] === 2, 'Every number of every batch has an entry.');
+
+	// -- 11. Employees of companies, and the ties between figures -----------------
+	$script([
+		$page('CVR_Virksomhed', [
+			$idNode('CVRNummer', 40386270, 'company-a'),
+			$idNode('CVRNummer', 40386271, 'company-b'),
+			$idNode('CVRNummer', 40386272, 'company-c'),
+		]),
+		$page('CVR_Beskaeftigelse', [
+			// A year and its last month end on the same day; the year has the higher count.
+			$figure('company-a', 'AarsbeskaeftigelseAntalAnsatte', 33, '2025-01-01', '2025-12-31'),
+			$figure('company-a', 'MaanedsbeskaeftigelseAntalAnsatte', 31, '2025-12-01', '2025-12-31'),
+			// An interval and an exact count of the same period; the interval is registered later.
+			$figure('company-b', 'KvartalsbeskaeftigelseAntalAnsatteInterval', null, '2026-04-01', '2026-06-30', 50, 99, '2026-07-20T08:00:00.000000+02:00'),
+			$figure('company-b', 'KvartalsbeskaeftigelseAntalAnsatte', 52, '2026-04-01', '2026-06-30', null, null, '2026-07-10T08:00:00.000000+02:00'),
+			// Two registrations of one figure: The first is later in UTC, the second sorts later as text.
+			$figure('company-c', 'MaanedsbeskaeftigelseAntalAnsatte', 7, '2026-03-01', '2026-03-31', null, null, '2026-03-29T02:30:00.000000+01:00'),
+			$figure('company-c', 'MaanedsbeskaeftigelseAntalAnsatte', 6, '2026-03-01', '2026-03-31', null, null, '2026-03-29T03:00:00.000000+02:00'),
+		]),
+	]);
+	$result = $cvr->getCompanyEmployees([40386270, '40386271', '40386272']);
+	$sent = $queries();
+	$check(\str_contains($sent[0], 'CVR_Virksomhed(') && $numbersIn($sent[0]) === [40386270, 40386271, 40386272], 'The id request of companies filters on the CVR numbers.');
+	$check($idsIn($sent[1]) === ['company-a', 'company-b', 'company-c'], 'The employment request of companies filters on their entity ids.');
+	$check($result[40386270]['count'] === 31, 'Of figures that end on the same day, the shorter period wins.');
+	$check($result[40386271]['count'] === 52, 'Of figures of the same period, an exact count wins over an interval.');
+	$check($result[40386272]['count'] === 7, 'Of two registrations of one figure, the later one in UTC wins.');
+
+	$script([$page('CVR_Virksomhed', [])]);
+	$check($cvr->getCompanyEmployees(['12345678']) === [12345678 => null], 'An unknown CVR number has no figure.');
+	$check(\count($queries()) === 1, 'No employment request is sent when no company was found.');
+
+	// -- 12. Employee input and responses that do not fit -------------------------
+	$script([]);
+	$check($cvr->getCompanyEmployees([]) === [] && $cvr->getProductionUnitEmployees([]) === [], 'An empty list of numbers returns an empty result.');
+	$throws(static fn() => $cvr->getProductionUnitEmployees(['123456789']), \InvalidArgumentException::class, 'A P-number with nine digits is rejected.');
+	$throws(static fn() => $cvr->getCompanyEmployees(['01234567']), \InvalidArgumentException::class, 'A CVR number with a leading zero is rejected.');
+	$check($curl->requests === [], 'Rejected numbers send no request.');
+
+	$script([$page('CVR_Produktionsenhed', [$idNode('pNummer', 1999999999, 'unit-x')])]);
+	$throws(static fn() => $cvr->getProductionUnitEmployees(['1024552248']), InvalidResponseException::class, 'An id row of a P-number that was not requested is rejected.');
+
+	$script([$page('CVR_Produktionsenhed', [$idNode('pNummer', 1024552248, null)])]);
+	$throws(static fn() => $cvr->getProductionUnitEmployees(['1024552248']), InvalidResponseException::class, 'An id row without an id is rejected.');
+
+	$script([
+		$page('CVR_Produktionsenhed', [$idNode('pNummer', 1024552248, 'unit-a')]),
+		$page('CVR_Beskaeftigelse', [$figure('unit-z', 'AarsbeskaeftigelseAntalAnsatte', 1, '2025-01-01', '2025-12-31')]),
+	]);
+	$throws(static fn() => $cvr->getProductionUnitEmployees(['1024552248']), InvalidResponseException::class, 'A figure of an entity that was not requested is rejected.');
+
+	foreach ([
+		'A negative count' => ['antal' => -1],
+		'A count that is not an integer' => ['antal' => '1.5'],
+		'An interval that ends before it starts' => ['antal' => null, 'intervalFra' => 20, 'intervalTil' => 10],
+		'A date that does not exist' => ['datoTil' => '2025-02-30'],
+		'A period that ends before it starts' => ['datoFra' => '2025-12-31', 'datoTil' => '2025-01-01'],
+		'A registration time that is not a time' => ['registreringsdato' => 'not a time'],
+		'A missing type' => ['beskaeftigelsestalstype' => null],
+	] as $label => $values) {
+		$script([
+			$page('CVR_Produktionsenhed', [$idNode('pNummer', 1024552248, 'unit-a')]),
+			$page('CVR_Beskaeftigelse', [\array_replace($figure('unit-a', 'AarsbeskaeftigelseAntalAnsatte', 5, '2025-01-01', '2025-12-31'), $values)]),
+		]);
+		$throws(static fn() => $cvr->getProductionUnitEmployees(['1024552248']), InvalidResponseException::class, $label . ' is rejected in a figure that counts employees.');
+	}
+
+	// The values of a figure that counts something else are never used, so they are not checked.
+	$script([
+		$page('CVR_Produktionsenhed', [$idNode('pNummer', 1024552248, 'unit-a')]),
+		$page('CVR_Beskaeftigelse', [\array_replace($figure('unit-a', 'AarsbeskaeftigelseAntalAarsvaerk', 5, '2025-01-01', '2025-12-31'), ['antal' => -1, 'datoTil' => 'x'])]),
+	]);
+	$check($cvr->getProductionUnitEmployees(['1024552248']) === [1024552248 => null], 'A figure of full-time equivalents is left out without a check of its values.');
+
+	// -- 13. Query documents against the bundled schema --------------------------
 	$schemaSource = (string)\file_get_contents($root . '/resources/bbr/FLEX_CURRENT_V003.schema.graphql');
 	$schemaSource = (string)\preg_replace('/""".*?"""\s*/s', '', $schemaSource);
 	\preg_match_all('/^(type|input) ([A-Za-z0-9_]+)(?:\s+implements\s+[^\{]+)?\s*\{\R(.*?)^\}/ms', $schemaSource, $blocks, \PREG_SET_ORDER);
@@ -583,6 +758,7 @@ namespace {
 	}
 	$check(isset($schema['type']['Query']['CVR_Produktionsenhed'], $schema['input']['CVR_ProduktionsenhedFilterInput']['pNummer']), 'The bundled schema parses.');
 
+	// Keyed by operation name, because the id query has the root field of the company or the unit query.
 	$joinCounts = [];
 	foreach (\array_unique($curl->sent) as $document) {
 		$tree = parseQueryDocument($document);
@@ -590,13 +766,16 @@ namespace {
 
 		$stats = checkFields($tree, 'Query', $schema);
 		$check($stats['joins'] <= 17 && $stats['depth'] <= 7, 'Every request stays within 17 joins in total and 7 in depth.');
-		$joinCounts[$tree[0]['name']] = $stats['joins'];
+		$joinCounts[\preg_match('/^query ([A-Za-z]+) \{/', $document, $match) === 1 ? $match[1] : ''] = $stats['joins'];
 	}
-	$check($joinCounts === ['CVR_Virksomhed' => 8, 'CVR_Produktionsenhed' => 7], 'The company query has 8 joins and the unit query 7.');
+	$check(
+		$joinCounts === ['CvrCompanies' => 8, 'CvrProductionUnits' => 7, 'CvrEntityIds' => 0, 'CvrEmployment' => 0],
+		'The company query has 8 joins, the unit query 7, and the id and employment queries none.'
+	);
 
 	\fwrite(
 		STDOUT,
-		'PASS ' . $checks . ' checks. CVR company and production-unit lookups against the flexibleCurrent v3 schema. PHP '
+		'PASS ' . $checks . ' checks. CVR company, production-unit and employee lookups against the flexibleCurrent v3 schema. PHP '
 		. \PHP_VERSION . '.' . \PHP_EOL
 	);
 }
