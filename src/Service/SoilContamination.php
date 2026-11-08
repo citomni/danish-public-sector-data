@@ -15,25 +15,26 @@ declare(strict_types=1);
 
 namespace CitOmni\DanishPublicSectorData\Service;
 
+use CitOmni\DanishPublicSectorData\Enum\SoilContaminationStatus;
 use CitOmni\DanishPublicSectorData\Exception\InvalidResponseException;
 use CitOmni\DanishPublicSectorData\Support\DatafordelerClient;
 use CitOmni\DanishPublicSectorData\Support\DkJordWfsClient;
 use CitOmni\Kernel\Service\BaseService;
 
 /**
- * SoilContamination: Read DKjord soil-contamination classifications for Danish cadastral parcels.
+ * SoilContamination: Read the DKjord soil-contamination status of Danish cadastral parcels.
  *
  * Behavior:
- * - Reads the public DKjord WFS layers used for parcel-linked soil-contamination classifications.
- * - Matches matrikelnumre exactly inside DKjord's semicolon-separated Lokalitetsmatrikler field.
+ * - Reads the status that DKjord registers on each parcel from the public DKjord WFS locality layer.
+ * - Matches matrikelnumre exactly inside the semicolon-separated Lokalitetsmatrikler field of that layer.
  * - Resolves a BFE number to its current physical cadastral parcels through Datafordeleren's Matriklen data.
- * - Returns explicit WFS layer classifications instead of translating legacy Parcel API status codes.
  *
  * Notes:
- * - Classification is derived from WFS layer membership, not from locality-level descriptive status text.
- * - No geometry is downloaded; the DKjord client requests only parcel-linkage metadata.
+ * - The status is the parcel's own status, not one derived from which status-declaration layers list the parcel.
+ * - Paabud, omraadeklassificering and nuancering are not part of the result.
+ * - No geometry is downloaded; the DKjord client requests only locality metadata.
  * - Owner apartments and buildings on foreign ground inherit the physical parcel scope of the underlying SFE.
- * - A successful lookup with no matching DKjord feature returns hasDkJordMatch=false rather than null.
+ * - A successful lookup of a parcel that no DKjord locality lists returns hasDkJordMatch=false rather than null.
  *
  * Typical usage:
  *   $result = $this->app->soilContamination->getByBfe(3208712);
@@ -46,19 +47,27 @@ final class SoilContamination extends BaseService {
 	private const int PAGE_SIZE = 1000;
 	private const int FILTER_LIST_SIZE = 100;
 
-	/** @var array<string,string> */
-	private const array DKJORD_LAYERS = [
-		'localized' => 'DKJord:View_LokaliseretFlader',
-		'v1' => 'DKJord:View_V1Flader',
-		'v2' => 'DKJord:View_V2Flader',
-		'removed_after_mapping' => 'DKJord:View_UEKFlader',
-		'removed_before_mapping' => 'DKJord:View_UIKFlader',
+	/** WFS type of the DKjord localities; Lokalitetsmatrikler lists each parcel of a locality with the parcel's status. */
+	private const string DKJORD_LOCALITY_TYPE = 'DKJord:View_Lokaliteter';
+
+	/** @var list<string> Locality properties that the lookup reads; geometry and descriptive fields stay out. */
+	private const array DKJORD_LOCALITY_PROPERTIES = [
+		'Lokalitetsnr',
+		'Lokalitetsnavn',
+		'Lokalitetsejerlavkode',
+		'Lokalitetsmatrikler',
 	];
 
-	/** @var array<string,true> */
-	private const array DKJORD_CERTIFICATE_LAYERS = [
-		'v1' => true,
-		'v2' => true,
+	/** @var array<string,SoilContaminationStatus> Parcel status texts of DKjord, keyed by the exact text. */
+	private const array DKJORD_STATUS_TEXTS = [
+		'V1 kortlagt' => SoilContaminationStatus::V1,
+		'V2 kortlagt' => SoilContaminationStatus::V2,
+		'V1 og V2 kortlagt' => SoilContaminationStatus::V1AndV2,
+		'Lokaliseret (uafklaret)' => SoilContaminationStatus::Localized,
+		// Code 12 of DKjord's status code list; assumed to carry this text, not yet seen in WFS data.
+		'Lokaliseret (uafklaret). Oprydning iværksat' => SoilContaminationStatus::Localized,
+		'Udgået efter kortlægning' => SoilContaminationStatus::RemovedAfterMapping,
+		'Udgået inden kortlægning' => SoilContaminationStatus::RemovedBeforeMapping,
 	];
 
 	private DatafordelerClient $datafordeler;
@@ -66,7 +75,7 @@ final class SoilContamination extends BaseService {
 	private string $matrikelService;
 	private string $matrikelVersion;
 
-	/** @var array<int,array<string,list<array<string,mixed>>>> */
+	/** @var array<int,array<string,array{statusTexts:array<string,true>,locations:array<string,?string>}>> Parsed DKjord localities per ejerlav, keyed by matrikelnummer. */
 	private array $dkJordDistrictCache = [];
 
 	/**
@@ -90,11 +99,21 @@ final class SoilContamination extends BaseService {
 	}
 
 	/**
-	 * Return DKjord WFS classifications for one exact cadastral parcel.
+	 * Return the DKjord soil-contamination status of one exact cadastral parcel.
+	 *
+	 * Behavior:
+	 * - status is the SoilContaminationStatus value of the status that DKjord registers on the parcel,
+	 *   and statusText DKjord's own text for it, such as "V1 og V2 kortlagt".
+	 * - A parcel that no DKjord locality lists has hasDkJordMatch=false, status and statusText null
+	 *   and no locations. This does not mean that the soil is uncontaminated.
+	 * - locations lists the DKjord localities that list the parcel, ordered by locationReference.
+	 * - Requests each ejerlav from DKjord once per service instance.
 	 *
 	 * @param int|string $cadastralDistrictIdentifier Official ejerlav identifier.
 	 * @param string $landParcelIdentifier Exact matrikelnummer within the cadastral district.
-	 * @return array<string,mixed> Normalized parcel classification result.
+	 * @return array{cadastralDistrictIdentifier:int,landParcelIdentifier:string,hasDkJordMatch:bool,status:?string,statusText:?string,locations:list<array{locationReference:string,locationName:?string}>,fetchedAt:string} Normalized parcel status.
+	 * @throws \InvalidArgumentException When an identifier is invalid.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When DKjord lists the parcel with an unknown status text or with several statuses, or returns a malformed locality.
 	 */
 	public function getByParcel(int|string $cadastralDistrictIdentifier, string $landParcelIdentifier): array {
 		$cadastralDistrictIdentifier = self::normalizePositiveInt(
@@ -103,7 +122,7 @@ final class SoilContamination extends BaseService {
 		);
 		$landParcelIdentifier = self::normalizeLandParcelIdentifier($landParcelIdentifier);
 
-		return self::normalizeWfsParcel(
+		return self::normalizeParcelStatus(
 			$cadastralDistrictIdentifier,
 			$landParcelIdentifier,
 			$this->loadDkJordDistrict($cadastralDistrictIdentifier)
@@ -185,10 +204,18 @@ final class SoilContamination extends BaseService {
 	}
 
 	/**
-	 * Resolve one BFE number to physical cadastral parcels and attach current DKjord WFS classifications.
+	 * Resolve one BFE number to physical cadastral parcels and attach their current DKjord status.
+	 *
+	 * Behavior:
+	 * - Every parcel gets contamination, the getByParcel() result for that parcel.
+	 * - hasDkJordMatch is true when DKjord lists at least one of the parcels.
+	 * - statuses holds each distinct parcel status once, in SoilContaminationStatus case order.
 	 *
 	 * @param int|string $bfeNumber Positive BFE number.
 	 * @return array<string,mixed>|null Normalized property parcel scope, or null when the BFE is not found in current Matriklen data.
+	 * @throws \InvalidArgumentException When the BFE number is invalid.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When DKjord lists one of the parcels with an unknown status text or with several statuses, or returns a malformed locality.
+	 * @see \CitOmni\DanishPublicSectorData\Service\SoilContamination::getByParcel()  The status result of each parcel.
 	 */
 	public function getByBfe(int|string $bfeNumber): ?array {
 		$scope = $this->getParcelsByBfe($bfeNumber);
@@ -197,7 +224,8 @@ final class SoilContamination extends BaseService {
 		}
 
 		$normalizedParcels = [];
-		$propertyClassifications = [];
+		$propertyStatuses = [];
+		$hasDkJordMatch = false;
 
 		foreach ($scope['parcels'] as $parcel) {
 			$contamination = $this->getByParcel(
@@ -205,17 +233,17 @@ final class SoilContamination extends BaseService {
 				$parcel['landParcelIdentifier']
 			);
 
-			foreach ($contamination['classifications'] as $classification) {
-				$propertyClassifications[$classification] = true;
+			if ($contamination['status'] !== null) {
+				$propertyStatuses[$contamination['status']] = true;
 			}
+			$hasDkJordMatch = $hasDkJordMatch || $contamination['hasDkJordMatch'];
 
 			$parcel['contamination'] = $contamination;
 			$normalizedParcels[] = $parcel;
 		}
 
-		$classifications = self::orderedClassifications($propertyClassifications);
-		$scope['hasDkJordMatch'] = $classifications !== [];
-		$scope['classifications'] = $classifications;
+		$scope['hasDkJordMatch'] = $hasDkJordMatch;
+		$scope['statuses'] = self::orderedStatuses($propertyStatuses);
 		$scope['fetchedAt'] = self::now();
 		$scope['parcels'] = $normalizedParcels;
 
@@ -223,125 +251,152 @@ final class SoilContamination extends BaseService {
 	}
 
 	/**
-	 * Load and cache all configured DKjord classification layers for one ejerlav.
+	 * Load, parse and cache the DKjord localities of one ejerlav.
 	 *
-	 * @return array<string,list<array<string,mixed>>>
+	 * @return array<string,array{statusTexts:array<string,true>,locations:array<string,?string>}> Parcels keyed by matrikelnummer.
 	 */
 	private function loadDkJordDistrict(int $cadastralDistrictIdentifier): array {
 		if (isset($this->dkJordDistrictCache[$cadastralDistrictIdentifier])) {
 			return $this->dkJordDistrictCache[$cadastralDistrictIdentifier];
 		}
 
-		$layers = [];
-		foreach (self::DKJORD_LAYERS as $classification => $typeName) {
-			$layers[$classification] = $this->dkJordWfs->getFeatures(
-				$typeName,
+		$parcels = self::parseLocalities(
+			$cadastralDistrictIdentifier,
+			$this->dkJordWfs->getFeatures(
+				self::DKJORD_LOCALITY_TYPE,
 				$cadastralDistrictIdentifier,
-				isset(self::DKJORD_CERTIFICATE_LAYERS[$classification])
-			);
-		}
+				self::DKJORD_LOCALITY_PROPERTIES
+			)
+		);
 
-		$this->dkJordDistrictCache[$cadastralDistrictIdentifier] = $layers;
+		$this->dkJordDistrictCache[$cadastralDistrictIdentifier] = $parcels;
 
-		return $layers;
+		return $parcels;
 	}
 
 	/**
-	 * Normalize exact parcel matches from DKjord WFS layer results.
+	 * Collect the status texts and localities of every parcel that the localities of one ejerlav list.
 	 *
-	 * @param array<string,list<array<string,mixed>>> $layers Features keyed by package classification.
-	 * @return array<string,mixed>
+	 * Lokalitetsmatrikler holds "matrikelnummer,status text" entries separated by semicolons. The
+	 * same locality can come in several features with the same list, and a parcel can repeat in one
+	 * list; both collapse here.
+	 *
+	 * @param list<array<string,mixed>> $features GeoJSON features of the locality layer.
+	 * @return array<string,array{statusTexts:array<string,true>,locations:array<string,?string>}> Parcels keyed by matrikelnummer; locations maps locality number to name.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When a feature is invalid, lies outside the ejerlav or holds a malformed entry.
 	 */
-	private static function normalizeWfsParcel(
-		int $cadastralDistrictIdentifier,
-		string $landParcelIdentifier,
-		array $layers
-	): array {
-		$matchedClassifications = [];
-		$registrations = [];
-		$registrationKeys = [];
-		$certificateUrls = [];
+	private static function parseLocalities(int $cadastralDistrictIdentifier, array $features): array {
+		$parcels = [];
 
-		foreach (self::DKJORD_LAYERS as $classification => $_typeName) {
-			$features = $layers[$classification] ?? [];
-			if (!\is_array($features)) {
-				throw new InvalidResponseException('DKjord WFS layer result must be an array.');
+		foreach ($features as $feature) {
+			if (!\is_array($feature) || !\is_array($feature['properties'] ?? null)) {
+				throw new InvalidResponseException('DKjord WFS locality layer contains an invalid feature.');
 			}
 
-			foreach ($features as $feature) {
-				if (!\is_array($feature) || !\is_array($feature['properties'] ?? null)) {
-					throw new InvalidResponseException('DKjord WFS layer contains an invalid feature.');
+			$properties = $feature['properties'];
+			$district = self::requiredInt(
+				$properties['Lokalitetsejerlavkode'] ?? null,
+				'DKjord Lokalitetsejerlavkode'
+			);
+			if ($district !== $cadastralDistrictIdentifier) {
+				throw new InvalidResponseException('DKjord WFS returned a locality outside the requested cadastral district.');
+			}
+
+			$locationReference = self::requiredString($properties['Lokalitetsnr'] ?? null, 'DKjord Lokalitetsnr');
+			$locationName = self::nullableString($properties['Lokalitetsnavn'] ?? null);
+
+			foreach (self::splitSemicolonList(self::nullableString($properties['Lokalitetsmatrikler'] ?? null)) as $entry) {
+				$separator = \strpos($entry, ',');
+				$landParcelIdentifier = $separator !== false ? \trim(\substr($entry, 0, $separator)) : '';
+				$statusText = $separator !== false ? \trim(\substr($entry, $separator + 1)) : '';
+
+				if ($landParcelIdentifier === '' || $statusText === '') {
+					throw new InvalidResponseException('DKjord Lokalitetsmatrikler contains a malformed entry in locality ' . $locationReference . '.');
 				}
 
-				$properties = $feature['properties'];
-				$district = self::requiredInt(
-					$properties['Lokalitetsejerlavkode'] ?? null,
-					'DKjord Lokalitets-ejerlavkode'
-				);
-				if ($district !== $cadastralDistrictIdentifier) {
-					throw new InvalidResponseException('DKjord WFS returned a feature outside the requested cadastral district.');
-				}
-
-				$parcelList = self::splitSemicolonList(self::nullableString($properties['Lokalitetsmatrikler'] ?? null));
-				if (!\in_array($landParcelIdentifier, $parcelList, true)) {
-					continue;
-				}
-
-				$matchedClassifications[$classification] = true;
-				$locationReference = self::nullableString($properties['Lokalitetsnr'] ?? null);
-				$guid = self::nullableString($properties['GUID'] ?? null);
-				$certificateUrl = self::findCertificateUrl(
-					self::nullableString($properties['Jordforureningsattester'] ?? null),
-					$cadastralDistrictIdentifier,
-					$landParcelIdentifier
-				);
-
-				if ($certificateUrl !== null) {
-					$certificateUrls[$certificateUrl] = true;
-				}
-
-				$key = $classification . "\0" . ($locationReference ?? '') . "\0" . ($certificateUrl ?? '');
-				if (isset($registrationKeys[$key])) {
-					continue;
-				}
-				$registrationKeys[$key] = true;
-
-				$registrations[] = [
-					'classification' => $classification,
-					'locationReference' => $locationReference,
-					'guid' => $guid,
-					'certificateUrl' => $certificateUrl,
-				];
+				$parcels[$landParcelIdentifier]['statusTexts'][$statusText] = true;
+				$parcels[$landParcelIdentifier]['locations'][$locationReference] = $locationName;
 			}
 		}
 
-		$classifications = self::orderedClassifications($matchedClassifications);
-		$certificateUrls = \array_keys($certificateUrls);
-		\sort($certificateUrls, \SORT_STRING);
+		return $parcels;
+	}
+
+	/**
+	 * Build the status result of one parcel from the parsed localities of its ejerlav.
+	 *
+	 * @param array<string,array{statusTexts:array<string,true>,locations:array<string,?string>}> $parcels Parsed parcels of the ejerlav, keyed by matrikelnummer.
+	 * @return array{cadastralDistrictIdentifier:int,landParcelIdentifier:string,hasDkJordMatch:bool,status:?string,statusText:?string,locations:list<array{locationReference:string,locationName:?string}>,fetchedAt:string}
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the parcel carries several status texts or an unknown one.
+	 */
+	private static function normalizeParcelStatus(
+		int $cadastralDistrictIdentifier,
+		string $landParcelIdentifier,
+		array $parcels
+	): array {
+		$parcel = $parcels[$landParcelIdentifier] ?? null;
+
+		if ($parcel === null) {
+			return [
+				'cadastralDistrictIdentifier' => $cadastralDistrictIdentifier,
+				'landParcelIdentifier' => $landParcelIdentifier,
+				'hasDkJordMatch' => false,
+				'status' => null,
+				'statusText' => null,
+				'locations' => [],
+				'fetchedAt' => self::now(),
+			];
+		}
+
+		$label = $cadastralDistrictIdentifier . ' ' . $landParcelIdentifier;
+		$statusTexts = \array_keys($parcel['statusTexts']);
+
+		// DKjord registers one status per parcel; two texts would leave the status ambiguous.
+		if (\count($statusTexts) !== 1) {
+			throw new InvalidResponseException('DKjord lists parcel ' . $label . ' with several statuses: ' . \implode(', ', $statusTexts) . '.');
+		}
+
+		$statusText = (string)$statusTexts[0];
+		$status = self::DKJORD_STATUS_TEXTS[$statusText] ?? null;
+		if ($status === null) {
+			throw new InvalidResponseException('DKjord lists parcel ' . $label . ' with an unknown status: ' . $statusText . '.');
+		}
+
+		$locations = [];
+		foreach ($parcel['locations'] as $locationReference => $locationName) {
+			$locations[] = [
+				'locationReference' => (string)$locationReference,
+				'locationName' => $locationName,
+			];
+		}
+		\usort(
+			$locations,
+			static fn(array $a, array $b): int => \strcmp($a['locationReference'], $b['locationReference'])
+		);
 
 		return [
 			'cadastralDistrictIdentifier' => $cadastralDistrictIdentifier,
 			'landParcelIdentifier' => $landParcelIdentifier,
-			'hasDkJordMatch' => $classifications !== [],
-			'classifications' => $classifications,
-			'registrations' => $registrations,
-			'certificateUrls' => $certificateUrls,
+			'hasDkJordMatch' => true,
+			'status' => $status->value,
+			'statusText' => $statusText,
+			'locations' => $locations,
 			'fetchedAt' => self::now(),
 		];
 	}
 
 	/**
-	 * Return matched classifications in the package's deterministic layer order.
+	 * Return statuses in SoilContaminationStatus case order.
 	 *
-	 * @param array<string,bool> $matched Classifications keyed by identifier.
+	 * @param array<string,bool> $statuses Status values as keys.
 	 * @return list<string>
 	 */
-	private static function orderedClassifications(array $matched): array {
+	private static function orderedStatuses(array $statuses): array {
 		$result = [];
 
-		foreach (self::DKJORD_LAYERS as $classification => $_typeName) {
-			if (isset($matched[$classification])) {
-				$result[] = $classification;
+		foreach (SoilContaminationStatus::cases() as $status) {
+			if (isset($statuses[$status->value])) {
+				$result[] = $status->value;
 			}
 		}
 
@@ -367,33 +422,6 @@ final class SoilContamination extends BaseService {
 		}
 
 		return $result;
-	}
-
-	/**
-	 * Find the DKjord certificate URL that belongs to one exact parcel.
-	 */
-	private static function findCertificateUrl(
-		?string $value,
-		int $cadastralDistrictIdentifier,
-		string $landParcelIdentifier
-	): ?string {
-		foreach (self::splitSemicolonList($value) as $url) {
-			$query = \parse_url($url, \PHP_URL_QUERY);
-			if (!\is_string($query) || $query === '') {
-				continue;
-			}
-
-			$params = [];
-			\parse_str($query, $params);
-			if (
-				(string)($params['elav'] ?? '') === (string)$cadastralDistrictIdentifier
-				&& (string)($params['matrnr'] ?? '') === $landParcelIdentifier
-			) {
-				return $url;
-			}
-		}
-
-		return null;
 	}
 
 	/**

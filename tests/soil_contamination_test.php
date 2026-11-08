@@ -24,6 +24,8 @@ namespace CitOmni\Kernel\Service {
 }
 
 namespace {
+	use CitOmni\DanishPublicSectorData\Enum\SoilContaminationStatus;
+	use CitOmni\DanishPublicSectorData\Exception\InvalidResponseException;
 	use CitOmni\DanishPublicSectorData\Service\SoilContamination;
 	use CitOmni\DanishPublicSectorData\Support\DkJordWfsClient;
 
@@ -31,6 +33,7 @@ namespace {
 
 	require_once $root . '/src/Exception/PublicDataException.php';
 	require_once $root . '/src/Exception/InvalidResponseException.php';
+	require_once $root . '/src/Enum/SoilContaminationStatus.php';
 	require_once $root . '/src/Service/SoilContamination.php';
 	require_once $root . '/src/Support/DkJordWfsClient.php';
 
@@ -48,73 +51,129 @@ namespace {
 		++$checks;
 	};
 
-	$layers = [
-		'localized' => [],
-		'v1' => [
-			[
-				'type' => 'Feature',
-				'properties' => [
-					'Lokalitetsnr' => '851-00047',
-					'Lokalitetsejerlavkode' => 2005352,
-					'Lokalitetsmatrikler' => '4bz;301a',
-					'Jordforureningsattester' => 'https://jord.miljoeportal.dk/report/?elav=2005352&matrnr=4bz;https://jord.miljoeportal.dk/report/?elav=2005352&matrnr=301a',
-					'GUID' => 'v1-guid',
-				],
-			],
-		],
-		'v2' => [
-			[
-				'type' => 'Feature',
-				'properties' => [
-					'Lokalitetsnr' => '851-00047',
-					'Lokalitetsejerlavkode' => 2005352,
-					'Lokalitetsmatrikler' => '310a;311a;311b;312',
-					'Jordforureningsattester' => 'https://jord.miljoeportal.dk/report/?elav=2005352&matrnr=310a;https://jord.miljoeportal.dk/report/?elav=2005352&matrnr=311a;https://jord.miljoeportal.dk/report/?elav=2005352&matrnr=311b;https://jord.miljoeportal.dk/report/?elav=2005352&matrnr=312',
-					'GUID' => 'v2-guid',
-				],
-			],
-		],
-		'removed_after_mapping' => [],
-		'removed_before_mapping' => [],
-	];
+	$throws = static function (string $class, callable $call, string $message) use (&$checks): void {
+		try {
+			$call();
+		} catch (\Throwable $error) {
+			if (!$error instanceof $class) {
+				throw new \RuntimeException('FAIL: ' . $message . ' (got ' . \get_class($error) . ': ' . $error->getMessage() . ')');
+			}
+			++$checks;
 
-	$parcel = $invoke('normalizeWfsParcel', 2005352, '311a', $layers);
-	$check($parcel['cadastralDistrictIdentifier'] === 2005352, 'Cadastral district is preserved.');
-	$check($parcel['landParcelIdentifier'] === '311a', 'Exact land parcel identifier is preserved.');
-	$check($parcel['hasDkJordMatch'] === true, 'Matching DKjord feature is reported.');
-	$check($parcel['classifications'] === ['v2'], 'Layer membership becomes the parcel classification.');
-	$check(\count($parcel['registrations']) === 1, 'One exact DKjord registration is returned.');
-	$check(($parcel['registrations'][0]['locationReference'] ?? null) === '851-00047', 'DKjord location reference is preserved.');
-	$check(($parcel['registrations'][0]['guid'] ?? null) === 'v2-guid', 'DKjord feature GUID is preserved.');
-	$check(
-		($parcel['registrations'][0]['certificateUrl'] ?? null) === 'https://jord.miljoeportal.dk/report/?elav=2005352&matrnr=311a',
-		'Exact parcel certificate URL is selected from a semicolon-separated source field.'
-	);
-	$check(
-		$parcel['certificateUrls'] === ['https://jord.miljoeportal.dk/report/?elav=2005352&matrnr=311a'],
-		'Certificate URLs are normalized and deduplicated.'
-	);
+			return;
+		}
 
-	$oldParcel = $invoke('normalizeWfsParcel', 2005352, '311', $layers);
-	$check($oldParcel['hasDkJordMatch'] === false, 'Parcel matching does not use substring semantics.');
-	$check($oldParcel['classifications'] === [], 'A non-exact matrikelnummer has no classification.');
-	$check($oldParcel['registrations'] === [], 'A non-exact matrikelnummer has no registrations.');
+		throw new \RuntimeException('FAIL: ' . $message . ' (nothing was thrown)');
+	};
 
-	$multi = $layers;
-	$multi['v1'][] = [
+	$feature = static fn(string $locationReference, ?string $locationName, int $district, ?string $parcels): array => [
 		'type' => 'Feature',
 		'properties' => [
-			'Lokalitetsnr' => '851-99999',
-			'Lokalitetsejerlavkode' => 2005352,
-			'Lokalitetsmatrikler' => '311a',
-			'Jordforureningsattester' => 'https://jord.miljoeportal.dk/report/?elav=2005352&matrnr=311a',
-			'GUID' => 'v1-second-guid',
+			'Lokalitetsnr' => $locationReference,
+			'Lokalitetsnavn' => $locationName,
+			'Lokalitetsejerlavkode' => $district,
+			'Lokalitetsmatrikler' => $parcels,
 		],
 	];
-	$multiParcel = $invoke('normalizeWfsParcel', 2005352, '311a', $multi);
-	$check($multiParcel['classifications'] === ['v1', 'v2'], 'Multiple matching WFS layers retain deterministic classification order.');
-	$check(\count($multiParcel['registrations']) === 2, 'Registrations from multiple classification layers are retained.');
-	$check(\count($multiParcel['certificateUrls']) === 1, 'Repeated certificate URLs are deduplicated across layers.');
+
+	// The same locality arrives in several features with the same list, and 4bz repeats inside it.
+	$main = '311a,V2 kortlagt;311b,V2 kortlagt;301a,V1 kortlagt;4ca,V1 og V2 kortlagt;4bz,V1 og V2 kortlagt;4bz,V1 og V2 kortlagt;312,V2 kortlagt';
+	$features = [
+		$feature('851-00047', 'Nedlagt svovlsyre og gødningsfabrik, Limfjordsvej', 2005352, $main),
+		$feature('851-00047', 'Nedlagt svovlsyre og gødningsfabrik, Limfjordsvej', 2005352, $main),
+		$feature('851-00470', null, 2005352, '7000e,Udgået efter kortlægning;4bz,V1 og V2 kortlagt'),
+		$feature('851-01234', 'Tidligere tankstation', 2005352, ' 1ee , Lokaliseret (uafklaret) ;; 2e,Udgået inden kortlægning;'),
+	];
+
+	$parcels = $invoke('parseLocalities', 2005352, $features);
+	$status = static fn(string $parcel): array => $invoke('normalizeParcelStatus', 2005352, $parcel, $parcels);
+
+	$parcel = $status('311a');
+	$check($parcel['cadastralDistrictIdentifier'] === 2005352, 'Cadastral district is preserved.');
+	$check($parcel['landParcelIdentifier'] === '311a', 'Exact land parcel identifier is preserved.');
+	$check($parcel['hasDkJordMatch'] === true, 'A listed parcel is reported as a DKjord match.');
+	$check($parcel['status'] === SoilContaminationStatus::V2->value, 'V2 kortlagt becomes the v2 status.');
+	$check($parcel['statusText'] === 'V2 kortlagt', 'DKjord status text is preserved.');
+	$check(
+		$parcel['locations'] === [['locationReference' => '851-00047', 'locationName' => 'Nedlagt svovlsyre og gødningsfabrik, Limfjordsvej']],
+		'Repeated features of one locality collapse into one location.'
+	);
+
+	$parcel = $status('4bz');
+	$check($parcel['status'] === SoilContaminationStatus::V1AndV2->value, 'V1 og V2 kortlagt becomes one v1_v2 status, not two.');
+	$check(
+		\array_column($parcel['locations'], 'locationReference') === ['851-00047', '851-00470'],
+		'A parcel in several localities lists each locality once, ordered by number.'
+	);
+	$check($parcel['locations'][1]['locationName'] === null, 'A locality without a name keeps a null name.');
+
+	$check($status('301a')['status'] === SoilContaminationStatus::V1->value, 'V1 kortlagt becomes the v1 status.');
+	$check($status('7000e')['status'] === SoilContaminationStatus::RemovedAfterMapping->value, 'Udgået efter kortlægning becomes removed_after_mapping.');
+	$check($status('2e')['status'] === SoilContaminationStatus::RemovedBeforeMapping->value, 'Udgået inden kortlægning becomes removed_before_mapping.');
+	$check($status('1ee')['status'] === SoilContaminationStatus::Localized->value, 'Entries are trimmed and empty entries are skipped.');
+	$check($status('312')['status'] === SoilContaminationStatus::V2->value, 'A numeric matrikelnummer is matched as well.');
+
+	$parcel = $status('311');
+	$check($parcel['hasDkJordMatch'] === false, 'Parcel matching does not use substring semantics.');
+	$check($parcel['status'] === null && $parcel['statusText'] === null, 'An unlisted parcel has no status.');
+	$check($parcel['locations'] === [], 'An unlisted parcel has no locations.');
+
+	$conflicting = $invoke('parseLocalities', 2005352, [
+		$feature('851-00001', null, 2005352, '10a,V1 kortlagt;10b,V2 kortlagt'),
+		$feature('851-00002', null, 2005352, '10a,V2 kortlagt'),
+	]);
+	$throws(
+		InvalidResponseException::class,
+		static fn() => $invoke('normalizeParcelStatus', 2005352, '10a', $conflicting),
+		'A parcel with two statuses is rejected instead of guessed.'
+	);
+	$check(
+		$invoke('normalizeParcelStatus', 2005352, '10b', $conflicting)['status'] === SoilContaminationStatus::V2->value,
+		'A conflict on one parcel does not affect the other parcels of the ejerlav.'
+	);
+
+	$unknown = $invoke('parseLocalities', 2005352, [$feature('851-00003', null, 2005352, '11a,V3 kortlagt')]);
+	$throws(
+		InvalidResponseException::class,
+		static fn() => $invoke('normalizeParcelStatus', 2005352, '11a', $unknown),
+		'An unknown status text is rejected instead of guessed.'
+	);
+
+	foreach (['311a', ',V2 kortlagt', '311a,', ' , '] as $entry) {
+		$throws(
+			InvalidResponseException::class,
+			static fn() => $invoke('parseLocalities', 2005352, [$feature('851-00004', null, 2005352, $entry)]),
+			'A malformed Lokalitetsmatrikler entry is rejected: "' . $entry . '".'
+		);
+	}
+	$throws(
+		InvalidResponseException::class,
+		static fn() => $invoke('parseLocalities', 2005352, [$feature('851-00005', null, 2005353, '1a,V1 kortlagt')]),
+		'A locality outside the requested ejerlav is rejected.'
+	);
+	$throws(
+		InvalidResponseException::class,
+		static fn() => $invoke('parseLocalities', 2005352, [['type' => 'Feature']]),
+		'A feature without properties is rejected.'
+	);
+	$check(
+		$invoke('parseLocalities', 2005352, [$feature('851-00006', null, 2005352, null)]) === [],
+		'A locality without parcels adds nothing.'
+	);
+
+	$statusTexts = (new \ReflectionClass(SoilContamination::class))->getConstant('DKJORD_STATUS_TEXTS');
+	foreach (['V1 kortlagt', 'V2 kortlagt', 'V1 og V2 kortlagt', 'Lokaliseret (uafklaret)', 'Udgået efter kortlægning', 'Udgået inden kortlægning'] as $text) {
+		$check(isset($statusTexts[$text]), 'Status text seen in DKjord WFS data is known: ' . $text . '.');
+	}
+	$check(
+		\count(\array_unique(\array_map(static fn(SoilContaminationStatus $value): string => $value->value, $statusTexts))) === \count(SoilContaminationStatus::cases()),
+		'Every SoilContaminationStatus case has at least one DKjord status text.'
+	);
+
+	$check(
+		$invoke('orderedStatuses', ['removed_after_mapping' => true, 'v1_v2' => true, 'v1' => true]) === ['v1', 'v1_v2', 'removed_after_mapping'],
+		'Property statuses follow SoilContaminationStatus case order.'
+	);
 
 	$check($invoke('splitSemicolonList', ' 4bz ; 301a;; ') === ['4bz', '301a'], 'Semicolon lists are trimmed without fuzzy matching.');
 	$check($invoke('splitSemicolonList', null) === [], 'Null semicolon lists normalize to an empty list.');
@@ -127,20 +186,22 @@ namespace {
 	$parcelScopeMethod = $soilReflection->getMethod('getParcelsByBfe');
 	$check($parcelScopeMethod->isPublic(), 'Pure BFE-to-parcel resolution is exposed without requiring DKjord WFS.');
 	$check(
-		$soilReflection->getConstant('DKJORD_CERTIFICATE_LAYERS') === ['v1' => true, 'v2' => true],
-		'Only V1 and V2 request the DKjord certificate property.'
+		$soilReflection->getConstant('DKJORD_LOCALITY_PROPERTIES') === ['Lokalitetsnr', 'Lokalitetsnavn', 'Lokalitetsejerlavkode', 'Lokalitetsmatrikler'],
+		'The locality request names only the properties the lookup reads.'
 	);
 
-	$wfsReflection = new \ReflectionClass(DkJordWfsClient::class);
-	$buildPropertyNames = $wfsReflection->getMethod('buildPropertyNames');
+	$buildPropertyNames = (new \ReflectionClass(DkJordWfsClient::class))->getMethod('buildPropertyNames');
 	$check(
-		$buildPropertyNames->invoke(null, false) === 'Lokalitetsnr,Lokalitetsejerlavkode,Lokalitetsmatrikler,GUID',
-		'Common WFS projection excludes the V1/V2-only certificate field.'
+		$buildPropertyNames->invoke(null, ['Lokalitetsnr', 'Lokalitetsmatrikler']) === 'Lokalitetsnr,Lokalitetsmatrikler',
+		'WFS projection joins the requested property names in order.'
 	);
-	$check(
-		$buildPropertyNames->invoke(null, true) === 'Lokalitetsnr,Lokalitetsejerlavkode,Lokalitetsmatrikler,GUID,Jordforureningsattester',
-		'V1/V2 WFS projection includes Jordforureningsattester.'
-	);
+	foreach ([[], ['Lokalitetsnr,GUID'], ['Lokalitets nr'], [42]] as $names) {
+		$throws(
+			\InvalidArgumentException::class,
+			static fn() => $buildPropertyNames->invoke(null, $names),
+			'WFS projection rejects an empty list or an invalid property name.'
+		);
+	}
 
 	$query = $invoke(
 		'buildSfeByBfeQuery',
@@ -164,7 +225,7 @@ namespace {
 
 	\fwrite(
 		STDOUT,
-		'PASS ' . $checks . ' checks. DKjord WFS parcel matching and Matriklen query contract. PHP '
+		'PASS ' . $checks . ' checks. DKjord locality status parsing and Matriklen query contract. PHP '
 		. \PHP_VERSION . '.' . \PHP_EOL
 	);
 }

@@ -27,21 +27,17 @@ use CitOmni\Kernel\App;
  * Behavior:
  * - Uses the anonymous DKjord WFS endpoint exposed by Danmarks Miljøportal.
  * - Restricts each request to one official ejerlav code with a server-side CQL filter.
- * - Requests only parcel-linkage metadata and omits geometry from the response.
- * - Requests Jordforureningsattester only for layers that publish that property.
+ * - Requests only the properties the caller names, so the response carries no geometry unless the caller names it.
  * - Validates the GeoJSON feature collection before returning source features.
  *
  * Notes:
  * - This client is internal; public package services own parcel matching and domain semantics.
- * - Layer names are supplied by the caller so transport stays independent of classification rules.
+ * - Layer and property names are supplied by the caller so transport stays independent of classification rules.
  * - The client rejects truncated feature collections instead of silently returning partial results.
  *
  * @internal
  */
 final class DkJordWfsClient {
-
-	private const string PROPERTY_NAMES = 'Lokalitetsnr,Lokalitetsejerlavkode,Lokalitetsmatrikler,GUID';
-	private const string CERTIFICATE_PROPERTY_NAME = 'Jordforureningsattester';
 
 	private App $app;
 	private string $baseUrl;
@@ -72,20 +68,16 @@ final class DkJordWfsClient {
 	/**
 	 * Return DKjord features from one WFS layer for one official ejerlav code.
 	 *
-	 * @param string $typeName Exact WFS type name, for example "DKJord:View_V2Flader".
+	 * @param string $typeName Exact WFS type name, for example "DKJord:View_Lokaliteter".
 	 * @param int $cadastralDistrictIdentifier Official ejerlav identifier.
-	 * @param bool $includeCertificateUrls Request Jordforureningsattester when the layer exposes it.
-	 * @return list<array<string,mixed>> GeoJSON features without geometry.
-	 * @throws \InvalidArgumentException When the layer name or district identifier is invalid.
+	 * @param list<string> $propertyNames Properties to request: letters, digits and underscores only.
+	 * @return list<array<string,mixed>> GeoJSON features with the requested properties.
+	 * @throws \InvalidArgumentException When the layer name, the district identifier or a property name is invalid.
 	 * @throws \CitOmni\DanishPublicSectorData\Exception\RateLimitException When DKjord rate-limits the request.
 	 * @throws \CitOmni\DanishPublicSectorData\Exception\RemoteServiceException When transport or HTTP execution fails.
 	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the response cannot be interpreted safely.
 	 */
-	public function getFeatures(
-		string $typeName,
-		int $cadastralDistrictIdentifier,
-		bool $includeCertificateUrls = false
-	): array {
+	public function getFeatures(string $typeName, int $cadastralDistrictIdentifier, array $propertyNames): array {
 		if (!\preg_match('/^DKJord:View_[A-Za-z0-9]+$/D', $typeName)) {
 			throw new \InvalidArgumentException('DKjord WFS type name is invalid.');
 		}
@@ -93,7 +85,7 @@ final class DkJordWfsClient {
 			throw new \InvalidArgumentException('DKjord cadastral district identifier must be positive.');
 		}
 
-		$propertyNames = self::buildPropertyNames($includeCertificateUrls);
+		$propertyNames = self::buildPropertyNames($propertyNames);
 
 		try {
 			$response = $this->app->curl->execute([
@@ -167,15 +159,25 @@ final class DkJordWfsClient {
 	}
 
 	/**
-	 * Build the WFS property projection for one layer capability.
+	 * Build the WFS property projection from the requested property names.
 	 *
-	 * @param bool $includeCertificateUrls Include the V1/V2-only Jordforureningsattester field.
-	 * @return string Comma-separated WFS property names.
+	 * @param list<string> $propertyNames Property names: letters, digits and underscores only.
+	 * @return string Comma-separated WFS property names, in the given order.
+	 * @throws \InvalidArgumentException When the list is empty or a name is not a valid property name.
 	 */
-	private static function buildPropertyNames(bool $includeCertificateUrls): string {
-		return $includeCertificateUrls
-			? self::PROPERTY_NAMES . ',' . self::CERTIFICATE_PROPERTY_NAME
-			: self::PROPERTY_NAMES;
+	private static function buildPropertyNames(array $propertyNames): string {
+		if ($propertyNames === []) {
+			throw new \InvalidArgumentException('DKjord WFS property names must not be empty.');
+		}
+
+		foreach ($propertyNames as $propertyName) {
+			// A comma or other separator would silently change the projection.
+			if (!\is_string($propertyName) || !\preg_match('/^[A-Za-z0-9_]+$/D', $propertyName)) {
+				throw new \InvalidArgumentException('DKjord WFS property name is invalid.');
+			}
+		}
+
+		return \implode(',', $propertyNames);
 	}
 
 	/**

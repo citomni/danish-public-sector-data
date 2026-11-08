@@ -127,7 +127,7 @@ php tests/bbr_address_parser_test.php
 
 ## Soil contamination lookup
 
-The provider exposes `soilContamination` for structured soil-contamination classifications from DKjord. Parcel lookup uses Danmarks Miljøportal's anonymous WFS endpoint; BFE-centered lookup additionally uses Datafordeleren's current Matriklen data to resolve the physical cadastral parcels belonging to the property.
+The provider exposes `soilContamination` for the soil-contamination status that DKjord registers on Danish cadastral parcels. Parcel lookup uses Danmarks Miljøportal's anonymous WFS endpoint; BFE-centered lookup additionally uses Datafordeleren's current Matriklen data to resolve the physical cadastral parcels belonging to the property.
 
 Lookup one exact cadastral parcel by official ejerlav code and matrikelnummer:
 
@@ -135,17 +135,18 @@ Lookup one exact cadastral parcel by official ejerlav code and matrikelnummer:
 $parcel = $this->app->soilContamination->getByParcel(2005352, '311a');
 ```
 
-The result always describes the requested parcel after a successful WFS lookup. `hasDkJordMatch=false` and an empty `classifications` list mean that none of the configured DKjord classification layers matched that exact ejerlav/matrikel pair; this must not be reworded as proof that the soil is uncontaminated.
+The status comes from the DKjord locality layer `DKJord:View_Lokaliteter`. Its `Lokalitetsmatrikler` field lists every parcel of a locality as `matrikelnummer,status text` entries separated by semicolons, and the status text is the status registered on the parcel itself. The service requests that layer once per ejerlav, without geometry, and matches the matrikelnummer exactly. The result carries:
 
-The initial WFS contract classifies exact parcel matches through these public DKjord layers:
+- `status`: a `SoilContaminationStatus` value (`CitOmni\DanishPublicSectorData\Enum`): `v1`, `v2`, `v1_v2`, `localized`, `removed_after_mapping` or `removed_before_mapping`.
+- `statusText`: DKjord's own text, such as `V1 og V2 kortlagt`.
+- `locations`: the DKjord localities that list the parcel, each with `locationReference` and `locationName`.
+- `hasDkJordMatch`: whether any DKjord locality lists the parcel.
 
-- `localized` from `DKJord:View_LokaliseretFlader`
-- `v1` from `DKJord:View_V1Flader`
-- `v2` from `DKJord:View_V2Flader`
-- `removed_after_mapping` from `DKJord:View_UEKFlader`
-- `removed_before_mapping` from `DKJord:View_UIKFlader`
+A parcel that no locality lists has `hasDkJordMatch=false` and `status=null`; this must not be reworded as proof that the soil is uncontaminated. The lookup throws `InvalidResponseException` instead of guessing when DKjord lists the parcel with an unknown status text or with two different statuses.
 
-Matching is exact inside DKjord's semicolon-separated `Lokalitetsmatrikler` field. The service deliberately derives classification from layer membership rather than legacy Parcel API status codes or locality-level descriptive status text. Geometry is not requested.
+The status is deliberately not derived from the status-declaration layers (`View_V1Flader`, `View_V2Flader`, `View_LokaliseretFlader`, `View_UEKFlader`, `View_UIKFlader`). A parcel is often listed in older declarations of its locality as well, so layer membership reports statuses that the parcel no longer has. The public Parcel API described in the DkJord wiki answers HTTP 404.
+
+Påbud, områdeklassificering and nuancering are not part of the result. They appear in the official jordforureningsattest at `https://jord.miljoeportal.dk/report/?elav={ejerlavskode}&matrnr={matrikelnummer}`.
 
 For property workflows, resolve the physical parcel scope from a BFE number:
 
@@ -153,7 +154,7 @@ For property workflows, resolve the physical parcel scope from a BFE number:
 $result = $this->app->soilContamination->getByBfe(3208712);
 ```
 
-The BFE lookup supports SFE, building-on-foreign-ground, and owner-apartment properties when an underlying SFE exists. It loads current Matriklen parcels, resolves their official ejerlav identifiers, attaches a normalized `contamination` result to every parcel, and returns a property-level union of matching classifications. A property without an underlying SFE can return `parcelResolutionStatus=no_underlying_sfe` without inventing a parcel association.
+The BFE lookup supports SFE, building-on-foreign-ground, and owner-apartment properties when an underlying SFE exists. It loads current Matriklen parcels, resolves their official ejerlav identifiers, attaches the `getByParcel()` result as `contamination` to every parcel, and returns the distinct parcel statuses in `statuses`. A property without an underlying SFE can return `parcelResolutionStatus=no_underlying_sfe` without inventing a parcel association.
 
 The local normalization/query-contract test does not make network requests:
 
@@ -432,6 +433,7 @@ The provider keeps the boundaries intentionally small:
 - `Support\DkJordWfsClient` isolates anonymous DKjord WFS transport and GeoJSON response validation.
 - `Support\SkatVatWebClient` isolates the temporary public SKAT web-flow transport details.
 - `Exception` contains transport-agnostic integration failure semantics.
+- `Enum` holds vocabularies that host apps store, such as `SoilContaminationStatus`.
 - No SQL, HTTP controller behavior, or CLI output belongs in these services.
 
 New public-sector sources should be added only when there is a concrete consumer.
