@@ -432,6 +432,7 @@ final class SoilContamination extends BaseService {
 	private function resolveMatrikelProperty(int $bfe, string $effectiveAt): ?array {
 		$sfe = $this->fetchOne(
 			'MAT_SamletFastEjendom',
+			'BFE ' . $bfe,
 			fn(?string $after): string => $this->buildSfeByBfeQuery($bfe, $effectiveAt, $after)
 		);
 		if ($sfe !== null) {
@@ -446,6 +447,7 @@ final class SoilContamination extends BaseService {
 
 		$bpfgFlade = $this->fetchOne(
 			'MAT_BygningPaaFremmedGrundFlade',
+			'BFE ' . $bfe,
 			fn(?string $after): string => $this->buildBpfgFladeByBfeQuery($bfe, $effectiveAt, $after)
 		);
 		if ($bpfgFlade !== null) {
@@ -454,6 +456,7 @@ final class SoilContamination extends BaseService {
 
 		$bpfgPunkt = $this->fetchOne(
 			'MAT_BygningPaaFremmedGrundPunkt',
+			'BFE ' . $bfe,
 			fn(?string $after): string => $this->buildBpfgPunktByBfeQuery($bfe, $effectiveAt, $after)
 		);
 		if ($bpfgPunkt !== null) {
@@ -462,6 +465,7 @@ final class SoilContamination extends BaseService {
 
 		$ownerApartment = $this->fetchOne(
 			'MAT_Ejerlejlighed',
+			'BFE ' . $bfe,
 			fn(?string $after): string => $this->buildOwnerApartmentByBfeQuery($bfe, $effectiveAt, $after)
 		);
 		if ($ownerApartment === null) {
@@ -478,6 +482,7 @@ final class SoilContamination extends BaseService {
 			if ($bpfgFladeId !== null) {
 				$parent = $this->fetchOne(
 					'MAT_BygningPaaFremmedGrundFlade',
+					'id ' . $bpfgFladeId,
 					fn(?string $after): string => $this->buildBpfgFladeByIdQuery($bpfgFladeId, $effectiveAt, $after)
 				);
 				$sfeId = \is_array($parent)
@@ -486,6 +491,7 @@ final class SoilContamination extends BaseService {
 			} elseif ($bpfgPunktId !== null) {
 				$parent = $this->fetchOne(
 					'MAT_BygningPaaFremmedGrundPunkt',
+					'id ' . $bpfgPunktId,
 					fn(?string $after): string => $this->buildBpfgPunktByIdQuery($bpfgPunktId, $effectiveAt, $after)
 				);
 				$sfeId = \is_array($parent)
@@ -528,7 +534,7 @@ final class SoilContamination extends BaseService {
 
 		foreach ($rows as $row) {
 			$status = self::nullableString($row['status'] ?? null);
-			if ($status !== null && !self::isCurrentParcelStatus($status)) {
+			if ($status !== null && !self::isCurrentStatus($status)) {
 				continue;
 			}
 			$result[] = $row;
@@ -574,18 +580,57 @@ final class SoilContamination extends BaseService {
 	}
 
 	/**
-	 * Fetch zero or one current node from one connection.
+	 * Fetch the current version of at most one Matriklen object from one connection.
+	 *
+	 * @param string $root Connection name.
+	 * @param string $subject What the lookup asks for, such as "BFE 123"; names it in the exception message.
+	 * @param callable(?string):string $queryBuilder Cursor-aware query builder whose nodes select id_lokalId and status.
+	 * @return array<string,mixed>|null The node, or null when no current version matches.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When several current objects match, or a response is malformed.
+	 * @see \CitOmni\DanishPublicSectorData\Service\SoilContamination::currentNode()  Which node counts as current.
 	 */
-	private function fetchOne(string $root, callable $queryBuilder): ?array {
-		$rows = $this->fetchAll($root, $queryBuilder);
-		if ($rows === []) {
-			return null;
-		}
-		if (\count($rows) !== 1) {
-			throw new InvalidResponseException('Datafordeler returned multiple current nodes for unique ' . $root . ' lookup.');
+	private function fetchOne(string $root, string $subject, callable $queryBuilder): ?array {
+		return self::currentNode($root, $subject, $this->fetchAll($root, $queryBuilder));
+	}
+
+	/**
+	 * Pick the current version of at most one Matriklen object from the nodes of a lookup.
+	 *
+	 * Behavior:
+	 * - Only nodes with status Gaeldende, or without a status, count. A preliminary version from a
+	 *   pending cadastral case (status Foreloebig) is ignored.
+	 * - Identical nodes count once.
+	 *
+	 * @param string $root Connection name.
+	 * @param string $subject What the lookup asks for; names it in the exception message.
+	 * @param list<array<string,mixed>> $nodes Nodes of the lookup.
+	 * @return array<string,mixed>|null The node, or null when no current version is left.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When several different current nodes remain.
+	 */
+	private static function currentNode(string $root, string $subject, array $nodes): ?array {
+		$current = [];
+		$statuses = [];
+
+		foreach ($nodes as $node) {
+			$status = self::nullableString($node['status'] ?? null);
+			$statuses[] = $status ?? 'none';
+			if ($status !== null && !self::isCurrentStatus($status)) {
+				continue;
+			}
+
+			if (!\in_array($node, $current, true)) {
+				$current[] = $node;
+			}
 		}
 
-		return $rows[0];
+		if (\count($current) > 1) {
+			throw new InvalidResponseException(
+				'Datafordeler returned ' . \count($current) . ' current ' . $root . ' nodes for ' . $subject
+				. ' (statuses of all nodes: ' . \implode(', ', $statuses) . ').'
+			);
+		}
+
+		return $current[0] ?? null;
 	}
 
 	/**
@@ -656,6 +701,7 @@ query SoilContaminationSfeByBfe {
 	) {
 		nodes {
 			id_lokalId
+			status
 		}
 		{$this->pageInfo()}
 	}
@@ -675,6 +721,7 @@ query SoilContaminationBpfgFladeByBfe {
 	) {
 		nodes {
 			id_lokalId
+			status
 			samletFastEjendomLokalId
 		}
 		{$this->pageInfo()}
@@ -695,6 +742,7 @@ query SoilContaminationBpfgPunktByBfe {
 	) {
 		nodes {
 			id_lokalId
+			status
 			samletFastEjendomLokalId
 		}
 		{$this->pageInfo()}
@@ -715,6 +763,7 @@ query SoilContaminationOwnerApartmentByBfe {
 	) {
 		nodes {
 			id_lokalId
+			status
 			samletFastEjendomLokalId
 			b_BygningPaaFremmedGrundFladeL
 			b_BygningPaaFremmedGrundPunktL
@@ -738,6 +787,7 @@ query SoilContaminationBpfgFladeById {
 	) {
 		nodes {
 			id_lokalId
+			status
 			samletFastEjendomLokalId
 		}
 		{$this->pageInfo()}
@@ -759,6 +809,7 @@ query SoilContaminationBpfgPunktById {
 	) {
 		nodes {
 			id_lokalId
+			status
 			samletFastEjendomLokalId
 		}
 		{$this->pageInfo()}
@@ -864,9 +915,9 @@ GRAPHQL;
 	}
 
 	/**
-	 * Return whether one Matriklen parcel status represents a current parcel.
+	 * Return whether a Matriklen status marks the current version of an object.
 	 */
-	private static function isCurrentParcelStatus(string $status): bool {
+	private static function isCurrentStatus(string $status): bool {
 		$normalized = \strtr(\trim($status), [
 			'Æ' => 'AE',
 			'Ø' => 'OE',

@@ -154,7 +154,7 @@ For property workflows, resolve the physical parcel scope from a BFE number:
 $result = $this->app->soilContamination->getByBfe(3208712);
 ```
 
-The BFE lookup supports SFE, building-on-foreign-ground, and owner-apartment properties when an underlying SFE exists. It loads current Matriklen parcels, resolves their official ejerlav identifiers, attaches the `getByParcel()` result as `contamination` to every parcel, and returns the distinct parcel statuses in `statuses`. A property without an underlying SFE can return `parcelResolutionStatus=no_underlying_sfe` without inventing a parcel association.
+The BFE lookup supports SFE, building-on-foreign-ground, and owner-apartment properties when an underlying SFE exists. It loads current Matriklen parcels, resolves their official ejerlav identifiers, attaches the `getByParcel()` result as `contamination` to every parcel, and returns the distinct parcel statuses in `statuses`. A property without an underlying SFE can return `parcelResolutionStatus=no_underlying_sfe` without inventing a parcel association. Only Matriklen objects with status Gældende count: the preliminary version (Foreløbig) that a pending cadastral case adds next to the current property is ignored, and two different current objects for one BFE throw `InvalidResponseException`.
 
 The local normalization/query-contract test does not make network requests:
 

@@ -178,9 +178,32 @@ namespace {
 	$check($invoke('splitSemicolonList', ' 4bz ; 301a;; ') === ['4bz', '301a'], 'Semicolon lists are trimmed without fuzzy matching.');
 	$check($invoke('splitSemicolonList', null) === [], 'Null semicolon lists normalize to an empty list.');
 
-	$check($invoke('isCurrentParcelStatus', 'GÆLDENDE') === true, 'Uppercase current Matriklen status is accepted.');
-	$check($invoke('isCurrentParcelStatus', 'Gældende') === true, 'Mixed-case current Matriklen status is accepted.');
-	$check($invoke('isCurrentParcelStatus', 'Foreløbig') === false, 'Non-current Matriklen status is rejected.');
+	$check($invoke('isCurrentStatus', 'GÆLDENDE') === true, 'Uppercase current Matriklen status is accepted.');
+	$check($invoke('isCurrentStatus', 'Gældende') === true, 'Mixed-case current Matriklen status is accepted.');
+	$check($invoke('isCurrentStatus', 'Foreløbig') === false, 'Non-current Matriklen status is rejected.');
+
+	// A pending cadastral case adds a preliminary version of the property next to the current one.
+	$current = ['id_lokalId' => 'sfe-1', 'status' => 'Gældende'];
+	$preliminary = ['id_lokalId' => 'sfe-1', 'status' => 'Foreløbig'];
+	$check($invoke('currentNode', 'MAT_SamletFastEjendom', 'BFE 1', []) === null, 'A lookup without nodes has no current node.');
+	$check($invoke('currentNode', 'MAT_SamletFastEjendom', 'BFE 1', [$current]) === $current, 'One current node is returned.');
+	$check($invoke('currentNode', 'MAT_SamletFastEjendom', 'BFE 1', [$preliminary, $current]) === $current, 'A preliminary version next to the current one is ignored.');
+	$check($invoke('currentNode', 'MAT_SamletFastEjendom', 'BFE 1', [$preliminary]) === null, 'A preliminary version alone is no current node.');
+	$check($invoke('currentNode', 'MAT_SamletFastEjendom', 'BFE 1', [$current, $current]) === $current, 'Identical current nodes count once.');
+	$check($invoke('currentNode', 'MAT_SamletFastEjendom', 'BFE 1', [['id_lokalId' => 'sfe-2']]) === ['id_lokalId' => 'sfe-2'], 'A node without status counts as current.');
+	$throws(
+		InvalidResponseException::class,
+		static fn() => $invoke('currentNode', 'MAT_SamletFastEjendom', 'BFE 1', [$current, ['id_lokalId' => 'sfe-2', 'status' => 'Gældende']]),
+		'Two different current properties for one BFE stay ambiguous.'
+	);
+	try {
+		$invoke('currentNode', 'MAT_SamletFastEjendom', 'BFE 1', [$current, $preliminary, ['id_lokalId' => 'sfe-1', 'status' => 'Gældende', 'samletFastEjendomLokalId' => 'x']]);
+	} catch (InvalidResponseException $error) {
+		$check(
+			$error->getMessage() === 'Datafordeler returned 2 current MAT_SamletFastEjendom nodes for BFE 1 (statuses of all nodes: Gældende, Foreløbig, Gældende).',
+			'The ambiguity message names the lookup and the statuses of all nodes.'
+		);
+	}
 
 	$soilReflection = new \ReflectionClass(SoilContamination::class);
 	$parcelScopeMethod = $soilReflection->getMethod('getParcelsByBfe');
@@ -212,6 +235,12 @@ namespace {
 	$check(\str_contains($query, 'MAT_SamletFastEjendom('), 'BFE lookup targets Matriklen SFE.');
 	$check(\str_contains($query, 'BFEnummer: { eq: 4268969 }'), 'BFE lookup is exact.');
 	$check(\str_contains($query, 'virkningstid: "2026-09-30T10:00:00Z"'), 'BFE lookup carries an explicit effect time.');
+	foreach (['buildSfeByBfeQuery', 'buildBpfgFladeByBfeQuery', 'buildBpfgPunktByBfeQuery', 'buildOwnerApartmentByBfeQuery'] as $builder) {
+		$check(\preg_match('/nodes \{\s+id_lokalId\s+status\s/', $invoke($builder, 4268969, '2026-09-30T10:00:00Z', null)) === 1, $builder . ' selects the status of each node.');
+	}
+	foreach (['buildBpfgFladeByIdQuery', 'buildBpfgPunktByIdQuery'] as $builder) {
+		$check(\preg_match('/nodes \{\s+id_lokalId\s+status\s/', $invoke($builder, 'id-1', '2026-09-30T10:00:00Z', null)) === 1, $builder . ' selects the status of each node.');
+	}
 
 	$query = $invoke(
 		'buildParcelsBySfeQuery',
