@@ -16,21 +16,21 @@ declare(strict_types=1);
 namespace CitOmni\DanishPublicSectorData\Exception;
 
 /**
- * Represents a failure returned by, or while contacting, a remote public data service.
+ * RemoteServiceException: Exception for a failure returned by, or while contacting, a remote service.
  *
- * Notes:
- * - Deliberately carries no request URL because authentication values may be URL query parameters.
- * - Deliberately does not expose raw remote response bodies.
+ * Lets a caller tell a request that failed from an answer that cannot be interpreted, and read the
+ * HTTP status when the service answered.
  */
 class RemoteServiceException extends PublicDataException {
 
+	/** HTTP status of the answer, or null when the request failed before an answer. */
 	private readonly ?int $statusCode;
 
 	/**
-	 * Create a remote-service exception with safe transport metadata.
+	 * Create the exception with the HTTP status of the answer.
 	 *
-	 * @param string $message Safe exception message without credentials or raw response content.
-	 * @param int|null $statusCode HTTP status code when available.
+	 * @param  string  $message  Message without credentials or raw response content.
+	 * @param  int|null  $statusCode  HTTP status, or null when there was no answer.
 	 */
 	public function __construct(string $message, ?int $statusCode = null) {
 		parent::__construct($message);
@@ -39,9 +39,9 @@ class RemoteServiceException extends PublicDataException {
 	}
 
 	/**
-	 * Return the HTTP status code when the remote service supplied one.
+	 * Return the HTTP status of the answer.
 	 *
-	 * @return int|null HTTP status code or null for transport-level failures.
+	 * @return int|null  Null for a failure before an answer, such as a transport failure.
 	 */
 	public function getStatusCode(): ?int {
 		return $this->statusCode;

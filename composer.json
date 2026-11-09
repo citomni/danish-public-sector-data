@@ -25,6 +25,12 @@
         "php": "^8.5",
         "citomni/infrastructure": "^1.0.1.1"
     },
+    "suggest": {
+        "citomni/cli": "Runs the bbr:schema-check command."
+    },
+    "conflict": {
+        "citomni/cli": "<1.0.0.1"
+    },
     "autoload": {
         "psr-4": {
             "CitOmni\\DanishPublicSectorData\\": "src/"
@@ -34,6 +40,9 @@
         "psr-4": {
             "CitOmni\\DanishPublicSectorData\\Tests\\": "tests/"
         }
+    },
+    "scripts": {
+        "test": "@php tests/run.php"
     },
     "config": {
         "sort-packages": true

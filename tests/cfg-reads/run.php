@@ -13,25 +13,33 @@ declare(strict_types=1);
  * please see the LICENSE file distributed with this source code.
  */
 
+namespace CitOmni\DanishPublicSectorData\Tests;
+
 use CitOmni\DanishPublicSectorData\Boot\Registry;
 
 /*
- * Package cfg reads: every path the package owns is read directly and exists in
- * Registry::CFG_COMMON, and every path it does not own is read with a fallback.
- * Scans src/ with the tokenizer, so commented-out code is ignored.
+ * Isolated suite for the package's cfg reads: Every path that src/ reads from the package's own
+ * cfg is read directly and exists in Registry::CFG_COMMON, and every path that it does not own is
+ * read with a fallback. Scans src/ with the tokenizer, so commented-out code is ignored.
+ *
+ * Usage:
+ *   php tests/cfg-reads/run.php
  */
 
-$root = \dirname(__DIR__);
-require_once $root . '/src/Boot/Registry.php';
+if (\PHP_SAPI !== 'cli') {
+	throw new \RuntimeException('CLI only.');
+}
 
-$checks = 0;
-$check = static function (bool $condition, string $message) use (&$checks): void {
-	if (!$condition) {
-		throw new \RuntimeException('FAIL: ' . $message);
-	}
+\set_error_handler(static function (int $errno, string $errstr, string $errfile, int $errline): bool {
+	throw new \ErrorException($errstr, 0, $errno, $errfile, $errline);
+});
 
-	++$checks;
-};
+require \dirname(__DIR__) . '/bootstrap.php';
+
+
+// ----------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------
 
 /**
  * Collect the App cfg reads in package source code.
@@ -154,8 +162,21 @@ function scanCfgReads(string $srcDir): array {
 	return $reads;
 }
 
+
 /**
- * Whether the package owns a cfg path.
+ * Return the cfg reads of src/, scanned once.
+ *
+ * @return list<array{file: string, line: int, path: string, guarded: bool, array: bool}>
+ */
+function reads(): array {
+	static $reads = null;
+
+	return $reads ??= scanCfgReads(\dirname(__DIR__, 2) . '/src');
+}
+
+
+/**
+ * Tell whether the package owns a cfg path.
  *
  * Notes:
  * - A root in CFG_COMMON belongs to the package; danish_public_sector_data is the only one.
@@ -168,7 +189,14 @@ function ownedPath(string $path): bool {
 	return \array_key_exists(\explode('.', $path)[0], Registry::CFG_COMMON);
 }
 
-/** True when $path (dot-separated) names a key in $cfg. */
+
+/**
+ * Tell whether a dotted path names a key in a cfg array.
+ *
+ * @param  array<string,mixed>  $cfg
+ * @param  string  $path  Dotted cfg path.
+ * @return bool
+ */
 function cfgHasPath(array $cfg, string $path): bool {
 	foreach (\explode('.', $path) as $key) {
 		if (!\is_array($cfg) || !\array_key_exists($key, $cfg)) {
@@ -179,33 +207,50 @@ function cfgHasPath(array $cfg, string $path): bool {
 	return true;
 }
 
-/** Format a read as file:line path for a report. */
-function describe(array $read): string {
-	return $read['file'] . ':' . $read['line'] . ' ' . ($read['path'] !== '' ? $read['path'] : '(cfg root)');
+
+/**
+ * List the reads that a filter selects, for a failure message.
+ *
+ * @param  \Closure(array{file: string, line: int, path: string, guarded: bool, array: bool}):bool  $filter
+ * @return string  The reads as file:line path, separated by semicolons; '' when none.
+ */
+function readsWhere(\Closure $filter): string {
+	$describe = static fn(array $read): string => $read['file'] . ':' . $read['line'] . ' ' . ($read['path'] !== '' ? $read['path'] : '(cfg root)');
+
+	return \implode('; ', \array_map($describe, \array_values(\array_filter(reads(), $filter))));
 }
 
-$reads = scanCfgReads($root . '/src');
-$paths = \array_column($reads, 'path');
-foreach (['danish_public_sector_data.bbr.current_service', 'danish_public_sector_data.datafordeler.base_url', 'danish_public_sector_data.skat_vat_web.connect_timeout'] as $known) {
-	$check(\in_array($known, $paths, true), "The scan finds {$known}; otherwise its patterns are stale.");
-}
 
-$list = static fn(callable $filter): string => \implode('; ', \array_map('describe', \array_values(\array_filter($reads, $filter))));
+// ----------------------------------------------------------------
+// Cases
+// ----------------------------------------------------------------
 
-$array = $list(static fn(array $read): bool => $read['array']);
-$check($array === '', 'Cfg is read with property syntax, which the scan can follow: ' . $array);
+test('The scan finds cfg reads that src/ is known to have', function (): void {
+	$paths = \array_column(reads(), 'path');
 
-$guarded = $list(static fn(array $read): bool => !$read['array'] && $read['guarded'] && ownedPath($read['path']));
-$check($guarded === '', 'Package-owned cfg is read without ??, isset(), empty() or ?->: ' . $guarded);
+	foreach (['danish_public_sector_data.bbr.current_service', 'danish_public_sector_data.datafordeler.base_url', 'danish_public_sector_data.skat_vat_web.connect_timeout'] as $known) {
+		check(\in_array($known, $paths, true), "The scan finds {$known}; otherwise its patterns are stale.");
+	}
+});
 
-$missing = $list(static fn(array $read): bool => !$read['array'] && ownedPath($read['path']) && !cfgHasPath(Registry::CFG_COMMON, $read['path']));
-$check($missing === '', 'Every package-owned path read in src/ exists in CFG_COMMON: ' . $missing);
+test('src/ reads cfg with property syntax, which the scan can follow', function (): void {
+	$array = readsWhere(static fn(array $read): bool => $read['array']);
+	check($array === '', 'Cfg is read with property syntax, which the scan can follow: ' . $array);
+});
 
-$direct = $list(static fn(array $read): bool => !$read['array'] && !$read['guarded'] && !ownedPath($read['path']));
-$check($direct === '', 'Cfg the package does not own is read with a fallback: ' . $direct);
+test('src/ reads its own cfg directly, without ??, isset(), empty() or ?->', function (): void {
+	$guarded = readsWhere(static fn(array $read): bool => !$read['array'] && $read['guarded'] && ownedPath($read['path']));
+	check($guarded === '', 'Package-owned cfg is read without ??, isset(), empty() or ?->: ' . $guarded);
+});
 
-\fwrite(
-	STDOUT,
-	'PASS ' . $checks . ' checks. Package cfg reads against the Registry baseline. PHP '
-	. \PHP_VERSION . '.' . \PHP_EOL
-);
+test('Every path of its own cfg that src/ reads exists in CFG_COMMON', function (): void {
+	$missing = readsWhere(static fn(array $read): bool => !$read['array'] && ownedPath($read['path']) && !cfgHasPath(Registry::CFG_COMMON, $read['path']));
+	check($missing === '', 'Every package-owned path read in src/ exists in CFG_COMMON: ' . $missing);
+});
+
+test('src/ reads cfg that the package does not own with a fallback', function (): void {
+	$direct = readsWhere(static fn(array $read): bool => !$read['array'] && !$read['guarded'] && !ownedPath($read['path']));
+	check($direct === '', 'Cfg the package does not own is read with a fallback: ' . $direct);
+});
+
+done();

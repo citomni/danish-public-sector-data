@@ -16,31 +16,30 @@ declare(strict_types=1);
 namespace CitOmni\DanishPublicSectorData\Util;
 
 /**
- * BbrCodeLists: Resolve labels from bundled official BBR code-list snapshots.
+ * BbrCodeLists: Util with the labels of the official BBR code lists, bundled as snapshots.
  *
- * Behavior:
- * - Resolves labels from the primary BBR Teknik snapshot captured on 2026-09-30.
- * - Adds code lists individually verified against BBR Teknik on 2026-10-01 when they are absent from the primary snapshot.
- * - Supplements remaining missing list/code pairs from the official KDS export covering the exposed code lists as of 2026-02-24.
- * - Keeps the primary snapshot authoritative when multiple bundled sources could describe the same list/code pair.
- * - Returns null for unknown list names or code values so callers can preserve safe code fallbacks.
+ * Gives every BBR normalizer the same label for a code, without a request or a file read at
+ * runtime. The labels come from three sources with dates of their own: The primary BBR Teknik
+ * snapshot, code lists verified one by one against BBR Teknik, and the KDS export. A code stays the
+ * authoritative value; a label only describes it.
  *
- * Notes:
- * - Verified and supplemental arrays are additive by construction and never replace an existing primary label.
- * - The static arrays avoid runtime CSV parsing, scraping, merging or extra HTTP requests.
- * - Codes remain authoritative in normalized BBR results; labels are additive source metadata.
- * - SNAPSHOT_DATE, VERIFIED_SOURCE_CHECK_DATE and SUPPLEMENT_COVERAGE_DATE describe different provenance dates.
- *
- * Typical usage:
- *   $label = BbrCodeLists::label('Tagdaekningsmateriale', '5');
+ * Rules:
+ * - Pure: Every result depends only on the arguments.
+ * - Hold each list/code pair in only one of LISTS, VERIFIED_LISTS and SUPPLEMENT_LISTS, so the
+ *   sources keep their provenance.
  */
-final class BbrCodeLists {
+class BbrCodeLists {
 
+	/** Date of the primary BBR Teknik snapshot in LISTS. */
 	public const string SNAPSHOT_DATE = '2026-09-30';
+
+	/** Date on which the code lists in VERIFIED_LISTS were verified against BBR Teknik. */
 	public const string VERIFIED_SOURCE_CHECK_DATE = '2026-10-01';
+
+	/** Date of the KDS export that SUPPLEMENT_LISTS comes from. */
 	public const string SUPPLEMENT_COVERAGE_DATE = '2026-02-24';
 
-	/** @var array<string,array<string,string>> */
+	/** @var array<string,array<string,string>> Labels of the primary BBR Teknik snapshot, by code-list name and code. */
 	private const array LISTS = [
 		'Afloebsforhold' => [
 			'1' => 'Fælleskloakeret: spildevand + tag- og overfladevand',
@@ -679,14 +678,7 @@ final class BbrCodeLists {
 		],
 	];
 
-	/**
-	 * Code lists individually verified against BBR Teknik on 2026-10-01.
-	 *
-	 * These lists are absent from both LISTS and the KDS 2026-02-24 export used for
-	 * SUPPLEMENT_LISTS. Keeping them separate preserves source provenance and lookup priority.
-	 *
-	 * @var array<string,array<string,string>>
-	 */
+	/** @var array<string,array<string,string>> Labels of code lists that neither LISTS nor the KDS export holds, verified one by one against BBR Teknik. */
 	private const array VERIFIED_LISTS = [
 		'AdresseRolle' => [
 			'0' => 'Fastsat til denne',
@@ -718,14 +710,7 @@ final class BbrCodeLists {
 		],
 	];
 
-	/**
-	 * Missing list/code pairs from the official KDS BBR code-list export dated 2026-02-24.
-	 *
-	 * The supplement is deliberately additive. No list/code pair in this array exists in LISTS,
-	 * so older source data can never replace a label from the newer primary snapshot.
-	 *
-	 * @var array<string,array<string,string>>
-	 */
+	/** @var array<string,array<string,string>> Labels from the KDS export of the list/code pairs that LISTS lacks. */
 	private const array SUPPLEMENT_LISTS = [
 		'AfvigendeEtager' => [
 			'0' => 'Bygningen har ikke afvigende etager',
@@ -1183,11 +1168,18 @@ final class BbrCodeLists {
 	];
 
 	/**
-	 * Return the bundled label for one BBR code.
+	 * Return the label of one BBR code.
 	 *
-	 * @param string $list Official BBR code-list name used by this package.
-	 * @param string|null $code BBR code value.
-	 * @return string|null Snapshot label, or null when the code is absent or unknown.
+	 * Behavior:
+	 * - Takes the label from LISTS first, then from VERIFIED_LISTS, then from SUPPLEMENT_LISTS.
+	 * - Returns null for a null or empty code, an unknown list and an unknown code.
+	 *
+	 * Typical usage:
+	 *   $label = BbrCodeLists::label('Tagdaekningsmateriale', '5');
+	 *
+	 * @param  string  $list  Name of the BBR code list, such as Tagdaekningsmateriale.
+	 * @param  string|null  $code  Code as BBR returns it.
+	 * @return string|null
 	 */
 	public static function label(string $list, ?string $code): ?string {
 		if ($code === null || $code === '') {

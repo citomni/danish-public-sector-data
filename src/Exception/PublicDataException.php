@@ -16,7 +16,15 @@ declare(strict_types=1);
 namespace CitOmni\DanishPublicSectorData\Exception;
 
 /**
- * Base exception for Danish public-sector data integrations.
+ * PublicDataException: Base exception of the package's public-sector data lookups.
+ *
+ * Exists so that a caller can catch the failures of a lookup in one catch, whichever source the
+ * lookup reads. Which subclass describes a failure belongs to the code that throws it; invalid
+ * method input is not a lookup failure and stays \InvalidArgumentException.
+ *
+ * Rules:
+ * - Never carry a credential, a raw response body or a request URL, which may hold an API key, in
+ *   a message or a property.
  */
 class PublicDataException extends \RuntimeException {
 }

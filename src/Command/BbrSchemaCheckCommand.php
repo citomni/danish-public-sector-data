@@ -18,10 +18,24 @@ namespace CitOmni\DanishPublicSectorData\Command;
 use CitOmni\DanishPublicSectorData\Operation\CheckBbrSchema;
 use CitOmni\Kernel\Command\BaseCommand;
 
-/** Check live Datafordeler BBR schemas for drift from the package runtime schemas. */
-final class BbrSchemaCheckCommand extends BaseCommand {
+/**
+ * BbrSchemaCheckCommand: CLI adapter that checks the live Datafordeler BBR schemas for drift.
+ *
+ * Lets operators and scripts see whether the BBR schemas that Datafordeler publishes still match
+ * the schemas the package bundles. It prints the result and maps it to an exit code; the
+ * comparison belongs to CheckBbrSchema.
+ *
+ * Rules:
+ * - Check only through CheckBbrSchema.
+ */
+class BbrSchemaCheckCommand extends BaseCommand {
 
-	/** Declare CLI options. */
+	/**
+	 * Declare the command interface.
+	 *
+	 * @return array{arguments?: array<string,array<string,mixed>>, options?: array<string,array<string,mixed>>}
+	 * @see \CitOmni\Kernel\Command\BaseCommand::signature()  The signature format.
+	 */
 	protected function signature(): array {
 		return [
 			'arguments' => [],
@@ -32,7 +46,17 @@ final class BbrSchemaCheckCommand extends BaseCommand {
 		];
 	}
 
-	/** Execute the schema drift check and return non-zero when drift is detected. */
+	/**
+	 * Check the endpoints in --scope and report the result.
+	 *
+	 * Behavior:
+	 * - Exit code 0 when CheckBbrSchema finds no drift, 1 when it reports drift.
+	 * - With --json: One JSON line on stdout with the result of CheckBbrSchema. Otherwise a report
+	 *   per endpoint and a result line.
+	 *
+	 * @return int  Process exit code.
+	 * @see \CitOmni\DanishPublicSectorData\Operation\CheckBbrSchema::execute()  The result behind the exit code and the JSON.
+	 */
 	protected function execute(): int {
 		$result = (new CheckBbrSchema($this->app))->execute($this->getString('scope'));
 
@@ -46,7 +70,12 @@ final class BbrSchemaCheckCommand extends BaseCommand {
 		return $result['status'] === CheckBbrSchema::RESULT_OK ? self::SUCCESS : self::FAILURE;
 	}
 
-	/** Render one human-readable schema check result. */
+	/**
+	 * Print the report of every checked endpoint and the result line.
+	 *
+	 * @param  array{status:string,checks:list<array<string,mixed>>}  $result  Result of CheckBbrSchema::execute().
+	 * @return void
+	 */
 	private function writeHumanResult(array $result): void {
 		$this->stdout('BBR schema drift check');
 		$this->stdout('');
@@ -75,7 +104,14 @@ final class BbrSchemaCheckCommand extends BaseCommand {
 		$this->warning('Result: BBR schema drift detected. Review the differences before updating bundled schemas or selections.');
 	}
 
-	/** Render a simple type-name list when non-empty. */
+	/**
+	 * Print a labelled list of type names; nothing for an empty list.
+	 *
+	 * @param  string  $label  Heading of the list.
+	 * @param  list<string>  $types  Type names.
+	 * @param  string  $prefix  Marker before each name, such as + or -.
+	 * @return void
+	 */
 	private function writeTypeList(string $label, array $types, string $prefix): void {
 		if ($types === []) {
 			return;
@@ -87,7 +123,12 @@ final class BbrSchemaCheckCommand extends BaseCommand {
 		}
 	}
 
-	/** Render field additions, removals and type changes grouped by BBR type. */
+	/**
+	 * Print the added, removed and changed fields of each changed type.
+	 *
+	 * @param  array<string,array{added_fields?:array<string,string>,removed_fields?:array<string,string>,changed_field_types?:array<string,array{bundled:string,remote:string}>}>  $changedTypes  Changes keyed by type name.
+	 * @return void
+	 */
 	private function writeChangedTypes(array $changedTypes): void {
 		foreach ($changedTypes as $typeName => $changes) {
 			$this->stdout('Changed type: ' . $typeName);

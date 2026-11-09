@@ -24,33 +24,24 @@ use CitOmni\Infrastructure\Exception\CurlException;
 use CitOmni\Kernel\App;
 
 /**
- * DatafordelerClient: Execute authenticated GraphQL queries against Datafordeleren.
+ * DatafordelerClient: Support class that sends authenticated GraphQL requests to Datafordeler.
  *
- * Behavior:
- * - Authenticates with the API key or with the Shared Secret, as the service that creates the
- *   client chooses, and reads the credentials lazily from the app-local secret store.
- * - With the Shared Secret, gets an OAuth access token from the token endpoint and reuses it in
- *   every client of the process with the same token endpoint and client id, until shortly before
- *   it expires.
- * - Sends GraphQL requests through the shared CitOmni Curl service.
- * - Maps HTTP, GraphQL, transport, and malformed-response failures to package exceptions.
- * - Marks the API-key query parameter as sensitive so exposed Curl URLs are redacted.
+ * Gives the package's services one way to reach Datafordeler: It authenticates every request,
+ * sends it through the curl service, and turns missing credentials, failed transfers, error
+ * answers and answers it cannot use into package exceptions. Which credentials a service needs,
+ * and what it asks for, belong to the service that creates the client.
  *
- * Notes:
- * - Access-restricted data, such as Ejerfortegnelsen, accepts only the Shared Secret.
- * - Datafordeleren places API keys in the request URL; Curl redacts the configured sensitive query key
- *   from logs, exceptions, and returned transport metadata while preserving the real outbound URL.
- * - The client secret travels only in the body of the token request and the access token only in the
- *   Authorization header, never in a URL.
- *
- * @throws \CitOmni\DanishPublicSectorData\Exception\AuthenticationException When the credentials are missing or rejected.
- * @throws \CitOmni\DanishPublicSectorData\Exception\RateLimitException When Datafordeleren rate-limits the request.
- * @throws \CitOmni\DanishPublicSectorData\Exception\RemoteServiceException When transport, HTTP, or GraphQL execution fails.
- * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the response is not valid GraphQL JSON.
+ * Rules:
+ * - Read the credentials from the secrets service, and only when a request needs them.
+ * - Mark the API key as a sensitive query key, so the curl service redacts it from every URL it
+ *   exposes.
+ * - Send the client secret only in the body of the token request, and an access token only in the
+ *   Authorization header.
  */
-final class DatafordelerClient {
+class DatafordelerClient {
 
-	private const API_KEY_SECRET = 'datafordeler.api_key';
+	/** Secret that holds the API key of the IT-system. */
+	private const string API_KEY_SECRET = 'datafordeler.api_key';
 
 	/** Secret that holds the client id of the IT-system's Shared Secret. */
 	private const string CLIENT_ID_SECRET = 'datafordeler.oauth_client_id';
@@ -67,9 +58,16 @@ final class DatafordelerClient {
 	/** @var array<string,array{token:string,expiresAt:int}> Access tokens of the process, keyed by token endpoint and client id; expiresAt is a Unix time. */
 	private static array $accessTokens = [];
 
+	/** App whose cfg, curl service and secrets service the client uses. */
 	private App $app;
+
+	/** Base URL of the GraphQL services, without a trailing slash. */
 	private string $baseUrl;
+
+	/** Request timeout in seconds. */
 	private int|float $timeout;
+
+	/** Connect timeout in seconds. */
 	private int|float $connectTimeout;
 
 	/** How the client authenticates. */
@@ -82,11 +80,11 @@ final class DatafordelerClient {
 	private ?string $accessTokenKey = null;
 
 	/**
-	 * Create the internal Datafordeler client and validate package configuration.
+	 * Read and check the Datafordeler cfg.
 	 *
-	 * @param App $app Application container.
-	 * @param DatafordelerAuthentication $authentication Credentials that every request of the client uses.
-	 * @throws \UnexpectedValueException When package configuration is invalid.
+	 * @param  App  $app
+	 * @param  DatafordelerAuthentication  $authentication  Credentials that every request of the client uses.
+	 * @throws \UnexpectedValueException  When cfg danish_public_sector_data.datafordeler has a base_url, or for the Shared Secret a token_url, that is not an HTTPS URL, or a timeout that is not a finite number of at least 0.
 	 */
 	public function __construct(App $app, DatafordelerAuthentication $authentication = DatafordelerAuthentication::ApiKey) {
 		$this->app = $app;
@@ -117,24 +115,26 @@ final class DatafordelerClient {
 	}
 
 	/**
-	 * Execute one GraphQL query against a Datafordeler service endpoint.
+	 * Send one GraphQL query and return its data.
 	 *
 	 * Behavior:
-	 * - Validates endpoint path components before building the URL.
-	 * - Uses the standard JSON GraphQL request envelope.
-	 * - Treats any GraphQL error array as a failed request, even when partial data is also returned.
-	 * - A rejected Shared Secret request discards the access token, so the next request gets a new one.
+	 * - Any GraphQL error fails the request, also when the answer holds data too.
+	 * - A request that Datafordeler rejects with 401 or 403 discards the client's access token, so
+	 *   the next request gets a new one.
 	 *
-	 * @param string $service Datafordeler GraphQL service path, for example "flexibleCurrent" or "CVR/custom".
-	 * @param string $version Service version in the form "vN".
-	 * @param string $query GraphQL query document.
-	 * @param array<string,mixed> $variables Optional GraphQL variables.
-	 * @return array<string,mixed> GraphQL data object.
-	 * @throws \InvalidArgumentException When endpoint or query input is invalid.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\AuthenticationException When the credentials are missing or rejected.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\RateLimitException When Datafordeleren rate-limits the request.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\RemoteServiceException When transport, HTTP, or GraphQL execution fails.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the response is malformed.
+	 * Typical usage:
+	 *   $data = (new DatafordelerClient($this->app))->query('flexibleCurrent', 'v3', $query);
+	 *
+	 * @param  string  $service  GraphQL service path, such as flexibleCurrent or CVR/custom.
+	 * @param  string  $version  Service version, such as v3.
+	 * @param  string  $query  GraphQL query document.
+	 * @param  array<string,mixed>  $variables  GraphQL variables; none when empty.
+	 * @return array<string,mixed>  The data object of the answer.
+	 * @throws \InvalidArgumentException  When the service path, the version or the query is invalid, or the query and its variables cannot be encoded as JSON.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\AuthenticationException  When a credential is missing, empty or rejected.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\RateLimitException  When Datafordeler rate-limits the request or its token request.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\RemoteServiceException  When the request fails, Datafordeler answers with another unsuccessful status, or the answer holds GraphQL errors.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the answer is not a GraphQL response with a data object, or a token answer holds no usable access token.
 	 */
 	public function query(string $service, string $version, string $query, array $variables = []): array {
 		$this->validateEndpoint($service, $version);
@@ -216,21 +216,25 @@ final class DatafordelerClient {
 	}
 
 	/**
-	 * Fetch one GraphQL schema document from Datafordeleren.
+	 * Download the GraphQL schema document of one service from its /schema endpoint.
 	 *
 	 * Behavior:
-	 * - Uses Datafordeler's documented GET /schema endpoint.
-	 * - Applies the same credentials, API-key redaction and transport failure mapping as GraphQL queries.
-	 * - Returns the raw GraphQL SDL document without transforming it.
+	 * - Authenticates, and reports failures, like query(), including the discarded access token
+	 *   after a 401 or 403.
+	 * - Returns the document as Datafordeler sends it.
 	 *
-	 * @param string $service Datafordeler GraphQL service path, for example "flexibleCurrent" or "BBR".
-	 * @param string $version Service version in the form "vN".
-	 * @return string Non-empty GraphQL SDL document.
-	 * @throws \InvalidArgumentException When endpoint input is invalid.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\AuthenticationException When the credentials are missing or rejected.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\RateLimitException When Datafordeleren rate-limits the request.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\RemoteServiceException When transport or HTTP execution fails.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the schema response is empty.
+	 * Typical usage:
+	 *   $sdl = (new DatafordelerClient($this->app))->schema('BBR', 'v3');
+	 *
+	 * @param  string  $service  GraphQL service path, such as flexibleCurrent or BBR.
+	 * @param  string  $version  Service version, such as v3.
+	 * @return string  GraphQL SDL; never empty.
+	 * @throws \InvalidArgumentException  When the service path or the version is invalid.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\AuthenticationException  When a credential is missing, empty or rejected.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\RateLimitException  When Datafordeler rate-limits the request or its token request.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\RemoteServiceException  When the request fails or Datafordeler answers with another unsuccessful status.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the document is empty, or a token answer holds no usable access token.
+	 * @see \CitOmni\DanishPublicSectorData\Support\DatafordelerClient::query()  The failures of a request.
 	 */
 	public function schema(string $service, string $version): string {
 		$this->validateEndpoint($service, $version);
@@ -277,13 +281,13 @@ final class DatafordelerClient {
 
 
 	/**
-	 * Return the Curl request keys that authenticate one request.
+	 * Return the curl request keys that authenticate one request.
 	 *
-	 * @return array<string,mixed> query and sensitive_query_keys with the API key, or bearer_token with an access token.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\AuthenticationException When a credential is missing, empty or rejected.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\RateLimitException When the token endpoint rate-limits the token request.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\RemoteServiceException When the token request fails.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the token answer is malformed.
+	 * @return array{query:array{apiKey:string},sensitive_query_keys:list<string>}|array{bearer_token:string}  The API key as a sensitive query parameter, or an access token for the Shared Secret.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\AuthenticationException  When a credential is missing, empty or rejected.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\RateLimitException  When the token endpoint rate-limits the token request.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\RemoteServiceException  When the token request fails.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the token answer holds no usable access token.
 	 */
 	private function credentials(): array {
 		if ($this->authentication === DatafordelerAuthentication::SharedSecret) {
@@ -301,12 +305,12 @@ final class DatafordelerClient {
 	}
 
 	/**
-	 * Return one credential from the app-local secret store.
+	 * Return one credential from the secrets service.
 	 *
-	 * @param string $key Secret key.
-	 * @param string $label Name of the credential in exception messages.
-	 * @return string Non-empty secret value.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\AuthenticationException When the secret is missing or empty.
+	 * @param  string  $key  Secret key.
+	 * @param  string  $label  Name of the credential in exception messages.
+	 * @return string  Never empty.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\AuthenticationException  When the secret is missing or empty.
 	 */
 	private function secret(string $key, string $label): string {
 		try {
@@ -327,14 +331,13 @@ final class DatafordelerClient {
 	 *
 	 * Behavior:
 	 * - Reuses the token that the process got for the same token endpoint and client id until
-	 *   TOKEN_RENEWAL_MARGIN seconds before it expires, and asks the token endpoint for a new
-	 *   one after that.
+	 *   TOKEN_RENEWAL_MARGIN seconds before it expires, and asks for a new one after that.
 	 *
-	 * @return string Access token without line breaks.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\AuthenticationException When a credential is missing, empty or rejected.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\RateLimitException When the token endpoint rate-limits the token request.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\RemoteServiceException When the token request fails.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the token answer is malformed.
+	 * @return string  Access token without line breaks.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\AuthenticationException  When a credential is missing, empty or rejected.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\RateLimitException  When the token endpoint rate-limits the token request.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\RemoteServiceException  When the token request fails.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the token answer holds no usable access token.
 	 */
 	private function accessToken(): string {
 		$clientId = $this->secret(self::CLIENT_ID_SECRET, 'OAuth client id');
@@ -354,13 +357,17 @@ final class DatafordelerClient {
 	/**
 	 * Ask the token endpoint for an access token with the client credentials grant.
 	 *
-	 * @param string $clientId Client id of the Shared Secret.
-	 * @param string $clientSecret Client secret of the Shared Secret.
-	 * @return array{token:string,expiresAt:int} Access token and its expiry as a Unix time.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\AuthenticationException When the token endpoint rejects the client credentials.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\RateLimitException When the token endpoint rate-limits the request.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\RemoteServiceException When transport or HTTP execution fails.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the answer holds no usable access token.
+	 * Behavior:
+	 * - The token expires expires_in seconds after the request was sent, or DEFAULT_TOKEN_LIFETIME
+	 *   seconds when the answer gives no positive expires_in.
+	 *
+	 * @param  string  $clientId  Client id of the Shared Secret.
+	 * @param  string  $clientSecret  Client secret of the Shared Secret.
+	 * @return array{token:string,expiresAt:int}  expiresAt is a Unix time.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\AuthenticationException  When the token endpoint rejects the client credentials with 400, 401 or 403.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\RateLimitException  When the token endpoint rate-limits the request.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\RemoteServiceException  When the request fails or the token endpoint answers with another unsuccessful status.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the answer is not JSON or holds no usable access token.
 	 */
 	private function requestAccessToken(string $clientId, #[\SensitiveParameter] string $clientSecret): array {
 		// Counted from before the request, so a slow answer cannot stretch the token's lifetime.
@@ -432,12 +439,12 @@ final class DatafordelerClient {
 	}
 
 	/**
-	 * Validate a GraphQL service path and version before URL construction.
+	 * Check a GraphQL service path and version before they become part of a URL.
 	 *
-	 * @param string $service Service path.
-	 * @param string $version Version string.
+	 * @param  string  $service  Service path: Segments of letters and digits, each starting with a letter, separated by /.
+	 * @param  string  $version  Version: v followed by a number of at least 1.
 	 * @return void
-	 * @throws \InvalidArgumentException When a path component is invalid.
+	 * @throws \InvalidArgumentException  When either does not have that form.
 	 */
 	private function validateEndpoint(string $service, string $version): void {
 		if (!\preg_match('/^[A-Za-z][A-Za-z0-9]*(?:\/[A-Za-z][A-Za-z0-9]*)*$/D', $service)) {
@@ -450,12 +457,12 @@ final class DatafordelerClient {
 	}
 
 	/**
-	 * Normalize a timeout without silently accepting invalid configuration.
+	 * Check one timeout from cfg.
 	 *
-	 * @param mixed $value Raw configured timeout.
-	 * @param string $key Configuration key for the exception message.
-	 * @return int|float Timeout in seconds.
-	 * @throws \UnexpectedValueException When the value is not a finite non-negative number.
+	 * @param  mixed  $value  Timeout from cfg.
+	 * @param  string  $key  Cfg key, for the exception message.
+	 * @return int|float  Timeout in seconds.
+	 * @throws \UnexpectedValueException  When the value is not a finite number of at least 0.
 	 */
 	private function normalizeTimeout(mixed $value, string $key): int|float {
 		if (!\is_int($value) && !\is_float($value)) {

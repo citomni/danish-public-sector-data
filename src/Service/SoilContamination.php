@@ -22,29 +22,74 @@ use CitOmni\DanishPublicSectorData\Support\DkJordWfsClient;
 use CitOmni\Kernel\Service\BaseService;
 
 /**
- * SoilContamination: Read the DKjord soil-contamination status of Danish cadastral parcels.
+ * SoilContamination: Service that reads the soil-contamination status that DKjord registers on Danish cadastral parcels.
  *
- * Behavior:
- * - Reads the status that DKjord registers on each parcel from the public DKjord WFS locality layer.
- * - Matches matrikelnumre exactly inside the semicolon-separated Lokalitetsmatrikler field of that layer.
- * - Resolves a BFE number to its current physical cadastral parcels through Datafordeleren's Matriklen data.
+ * Gives host apps the status of a parcel, or of the parcels of a property, from the DKjord
+ * localities and from Datafordeler's Matriklen data. The status is the one DKjord registers on the
+ * parcel itself, not one derived from the status-declaration layers that list the parcel; Paabud,
+ * omraadeklassificering and nuancering are not part of it. Transport belongs to DatafordelerClient
+ * and DkJordWfsClient.
  *
- * Notes:
- * - The status is the parcel's own status, not one derived from which status-declaration layers list the parcel.
- * - Paabud, omraadeklassificering and nuancering are not part of the result.
- * - No geometry is downloaded; the DKjord client requests only locality metadata.
- * - Owner apartments and buildings on foreign ground inherit the physical parcel scope of the underlying SFE.
- * - A successful lookup of a parcel that no DKjord locality lists returns hasDkJordMatch=false rather than null.
+ * Rules:
+ * - Fail rather than guess when DKjord or Matriklen is ambiguous, such as an unknown status text,
+ *   two statuses of one parcel or two current properties with one BFE number.
+ * - Never present a parcel that no locality lists as uncontaminated: Its status is null.
  *
- * Typical usage:
- *   $result = $this->app->soilContamination->getByBfe(3208712);
- *   $parcel = $this->app->soilContamination->getByParcel(2005352, '311a');
- *
- * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When a remote lookup fails.
+ * @phpstan-type SoilParcelStatus array{
+ *     cadastralDistrictIdentifier:int,
+ *     landParcelIdentifier:string,
+ *     hasDkJordMatch:bool,
+ *     status:?string,
+ *     statusText:?string,
+ *     locations:list<array{locationReference:string,locationName:?string}>,
+ *     fetchedAt:string
+ * }
+ * @phpstan-type SoilParcel array{
+ *     landParcelId:string,
+ *     cadastralDistrictId:string,
+ *     cadastralDistrictIdentifier:int,
+ *     cadastralDistrictName:?string,
+ *     landParcelIdentifier:string,
+ *     registeredArea:?int,
+ *     matrikelStatus:?string
+ * }
+ * @phpstan-type SoilParcelScope array{
+ *     bfeNumber:int,
+ *     propertyType:string,
+ *     propertyId:string,
+ *     underlyingSfeId:?string,
+ *     parcelResolutionStatus:string,
+ *     fetchedAt:string,
+ *     parcels:list<SoilParcel>
+ * }
+ * @phpstan-type SoilParcelWithStatus array{
+ *     landParcelId:string,
+ *     cadastralDistrictId:string,
+ *     cadastralDistrictIdentifier:int,
+ *     cadastralDistrictName:?string,
+ *     landParcelIdentifier:string,
+ *     registeredArea:?int,
+ *     matrikelStatus:?string,
+ *     contamination:SoilParcelStatus
+ * }
+ * @phpstan-type SoilPropertyStatus array{
+ *     bfeNumber:int,
+ *     propertyType:string,
+ *     propertyId:string,
+ *     underlyingSfeId:?string,
+ *     parcelResolutionStatus:string,
+ *     fetchedAt:string,
+ *     parcels:list<SoilParcelWithStatus>,
+ *     hasDkJordMatch:bool,
+ *     statuses:list<string>
+ * }
  */
-final class SoilContamination extends BaseService {
+class SoilContamination extends BaseService {
 
+	/** Page size of the Matriklen lookups of parcels and of ejerlav. */
 	private const int PAGE_SIZE = 1000;
+
+	/** Maximum number of ids in one in filter. */
 	private const int FILTER_LIST_SIZE = 100;
 
 	/** WFS type of the DKjord localities; Lokalitetsmatrikler lists each parcel of a locality with the parcel's status. */
@@ -70,19 +115,27 @@ final class SoilContamination extends BaseService {
 		'Udgået inden kortlægning' => SoilContaminationStatus::RemovedBeforeMapping,
 	];
 
+	/** Datafordeler client for Matriklen, which authenticates with the API key. */
 	private DatafordelerClient $datafordeler;
+
+	/** Client of the DKjord WFS. */
 	private DkJordWfsClient $dkJordWfs;
+
+	/** Datafordeler service that serves Matriklen. */
 	private string $matrikelService;
+
+	/** Version of that service. */
 	private string $matrikelVersion;
 
 	/** @var array<int,array<string,array{statusTexts:array<string,true>,locations:array<string,?string>}>> Parsed DKjord localities per ejerlav, keyed by matrikelnummer. */
 	private array $dkJordDistrictCache = [];
 
 	/**
-	 * Initialize the Matriklen and DKjord WFS clients.
+	 * Read the Matriklen endpoint from cfg and create the Datafordeler and DKjord clients.
 	 *
 	 * @return void
-	 * @throws \UnexpectedValueException When package configuration is incomplete.
+	 * @throws \UnexpectedValueException  When cfg danish_public_sector_data.soil_contamination.matrikel_service or .matrikel_version is empty, or the Datafordeler or DKjord WFS cfg is invalid.
+	 * @see \CitOmni\Kernel\Service\BaseService::__construct()  Calls it once per instance.
 	 */
 	protected function init(): void {
 		$cfg = $this->app->cfg->danish_public_sector_data->soil_contamination;
@@ -99,21 +152,27 @@ final class SoilContamination extends BaseService {
 	}
 
 	/**
-	 * Return the DKjord soil-contamination status of one exact cadastral parcel.
+	 * Return the DKjord soil-contamination status of one cadastral parcel.
 	 *
 	 * Behavior:
-	 * - status is the SoilContaminationStatus value of the status that DKjord registers on the parcel,
-	 *   and statusText DKjord's own text for it, such as "V1 og V2 kortlagt".
-	 * - A parcel that no DKjord locality lists has hasDkJordMatch=false, status and statusText null
+	 * - status is the SoilContaminationStatus value of the status that DKjord registers on the
+	 *   parcel, and statusText DKjord's own text for it, such as "V1 og V2 kortlagt".
+	 * - A parcel that no DKjord locality lists has hasDkJordMatch false, status and statusText null
 	 *   and no locations. This does not mean that the soil is uncontaminated.
 	 * - locations lists the DKjord localities that list the parcel, ordered by locationReference.
+	 * - The matrikelnummer must match exactly; 311 does not match 311a.
+	 * - fetchedAt is the time of the call in UTC, such as 2026-01-31T12:00:00Z.
 	 * - Requests each ejerlav from DKjord once per service instance.
 	 *
-	 * @param int|string $cadastralDistrictIdentifier Official ejerlav identifier.
-	 * @param string $landParcelIdentifier Exact matrikelnummer within the cadastral district.
-	 * @return array{cadastralDistrictIdentifier:int,landParcelIdentifier:string,hasDkJordMatch:bool,status:?string,statusText:?string,locations:list<array{locationReference:string,locationName:?string}>,fetchedAt:string} Normalized parcel status.
-	 * @throws \InvalidArgumentException When an identifier is invalid.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When DKjord lists the parcel with an unknown status text or with several statuses, or returns a malformed locality.
+	 * Typical usage:
+	 *   $parcel = $this->app->soilContamination->getByParcel(2005352, '311a');
+	 *
+	 * @param  int|string  $cadastralDistrictIdentifier  Official ejerlav code: A positive integer without leading zeroes.
+	 * @param  string  $landParcelIdentifier  Matrikelnummer within the ejerlav, such as 311a: At most 64 bytes without control characters; surrounding whitespace is ignored.
+	 * @return SoilParcelStatus
+	 * @throws \InvalidArgumentException  When an identifier is invalid.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When DKjord lists the parcel with an unknown status text or with several statuses, or returns a malformed locality.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When the DKjord lookup fails.
 	 */
 	public function getByParcel(int|string $cadastralDistrictIdentifier, string $landParcelIdentifier): array {
 		$cadastralDistrictIdentifier = self::normalizePositiveInt(
@@ -130,15 +189,30 @@ final class SoilContamination extends BaseService {
 	}
 
 	/**
-	 * Resolve one BFE number to its current physical cadastral parcel scope.
+	 * Return the current cadastral parcels of the ground of one property by BFE number.
+	 *
+	 * Resolves the property in current Matriklen data and the SFE whose parcels make up its ground,
+	 * without asking DKjord.
 	 *
 	 * Behavior:
-	 * - Resolves SFE/BPFG/owner-apartment relations through current Matriklen data.
-	 * - Returns current parcel identifiers and cadastral district metadata only.
-	 * - Does not call DKjord WFS.
+	 * - propertyType is sfe, bpfg or ejerlejlighed, and propertyId the property's Matriklen id.
+	 * - underlyingSfeId is the property itself for an SFE, and for a building on foreign ground or an
+	 *   owner apartment the SFE it stands on; null when Matriklen names none.
+	 * - parcels lists the current parcels of that SFE, ordered by ejerlav code and matrikelnummer.
+	 * - parcelResolutionStatus is resolved, no_current_parcels when the SFE has no current parcel, or
+	 *   no_underlying_sfe when there is no SFE.
+	 * - Only Matriklen objects with status Gaeldende, or without a status, count: A preliminary
+	 *   version from a pending cadastral case is ignored.
+	 * - fetchedAt is the time of the call in UTC, such as 2026-01-31T12:00:00Z.
 	 *
-	 * @param int|string $bfeNumber Positive BFE number.
-	 * @return array<string,mixed>|null Normalized property parcel scope, or null when the BFE is not found in current Matriklen data.
+	 * Typical usage:
+	 *   $scope = $this->app->soilContamination->getParcelsByBfe(3208712);
+	 *
+	 * @param  int|string  $bfeNumber  BFE number: A positive integer without leading zeroes.
+	 * @return SoilParcelScope|null  Null when current Matriklen data has no property with the number.
+	 * @throws \InvalidArgumentException  When the BFE number is invalid.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When Matriklen has several current properties with the number, a parcel without its ejerlav, or a malformed answer.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a Matriklen lookup fails.
 	 */
 	public function getParcelsByBfe(int|string $bfeNumber): ?array {
 		$bfe = self::normalizePositiveInt($bfeNumber, 'BFE number');
@@ -204,18 +278,23 @@ final class SoilContamination extends BaseService {
 	}
 
 	/**
-	 * Resolve one BFE number to physical cadastral parcels and attach their current DKjord status.
+	 * Return the current cadastral parcels of one property by BFE number, each with its DKjord status.
 	 *
 	 * Behavior:
 	 * - Every parcel gets contamination, the getByParcel() result for that parcel.
 	 * - hasDkJordMatch is true when DKjord lists at least one of the parcels.
 	 * - statuses holds each distinct parcel status once, in SoilContaminationStatus case order.
 	 *
-	 * @param int|string $bfeNumber Positive BFE number.
-	 * @return array<string,mixed>|null Normalized property parcel scope, or null when the BFE is not found in current Matriklen data.
-	 * @throws \InvalidArgumentException When the BFE number is invalid.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When DKjord lists one of the parcels with an unknown status text or with several statuses, or returns a malformed locality.
-	 * @see \CitOmni\DanishPublicSectorData\Service\SoilContamination::getByParcel()  The status result of each parcel.
+	 * Typical usage:
+	 *   $result = $this->app->soilContamination->getByBfe(3208712);
+	 *
+	 * @param  int|string  $bfeNumber  BFE number: A positive integer without leading zeroes.
+	 * @return SoilPropertyStatus|null  Null when current Matriklen data has no property with the number.
+	 * @throws \InvalidArgumentException  When the BFE number is invalid.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When Matriklen or DKjord is ambiguous or malformed, as getParcelsByBfe() and getByParcel() describe.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a Matriklen or DKjord lookup fails.
+	 * @see \CitOmni\DanishPublicSectorData\Service\SoilContamination::getParcelsByBfe()  The property and its parcels.
+	 * @see \CitOmni\DanishPublicSectorData\Service\SoilContamination::getByParcel()  The status of each parcel.
 	 */
 	public function getByBfe(int|string $bfeNumber): ?array {
 		$scope = $this->getParcelsByBfe($bfeNumber);
@@ -251,9 +330,11 @@ final class SoilContamination extends BaseService {
 	}
 
 	/**
-	 * Load, parse and cache the DKjord localities of one ejerlav.
+	 * Return the parsed DKjord localities of one ejerlav, requested once per service instance.
 	 *
-	 * @return array<string,array{statusTexts:array<string,true>,locations:array<string,?string>}> Parcels keyed by matrikelnummer.
+	 * @param  int  $cadastralDistrictIdentifier  Official ejerlav code.
+	 * @return array<string,array{statusTexts:array<string,true>,locations:array<string,?string>}>  Parcels keyed by matrikelnummer.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When the DKjord lookup fails or a locality is malformed.
 	 */
 	private function loadDkJordDistrict(int $cadastralDistrictIdentifier): array {
 		if (isset($this->dkJordDistrictCache[$cadastralDistrictIdentifier])) {
@@ -281,9 +362,10 @@ final class SoilContamination extends BaseService {
 	 * same locality can come in several features with the same list, and a parcel can repeat in one
 	 * list; both collapse here.
 	 *
-	 * @param list<array<string,mixed>> $features GeoJSON features of the locality layer.
-	 * @return array<string,array{statusTexts:array<string,true>,locations:array<string,?string>}> Parcels keyed by matrikelnummer; locations maps locality number to name.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When a feature is invalid, lies outside the ejerlav or holds a malformed entry.
+	 * @param  int  $cadastralDistrictIdentifier  Official ejerlav code that every locality must have.
+	 * @param  list<array<string,mixed>>  $features  GeoJSON features of the locality layer.
+	 * @return array<string,array{statusTexts:array<string,true>,locations:array<string,?string>}>  Parcels keyed by matrikelnummer; locations maps locality number to name.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When a feature is invalid, lies outside the ejerlav or holds a malformed entry.
 	 */
 	private static function parseLocalities(int $cadastralDistrictIdentifier, array $features): array {
 		$parcels = [];
@@ -325,9 +407,11 @@ final class SoilContamination extends BaseService {
 	/**
 	 * Build the status result of one parcel from the parsed localities of its ejerlav.
 	 *
-	 * @param array<string,array{statusTexts:array<string,true>,locations:array<string,?string>}> $parcels Parsed parcels of the ejerlav, keyed by matrikelnummer.
-	 * @return array{cadastralDistrictIdentifier:int,landParcelIdentifier:string,hasDkJordMatch:bool,status:?string,statusText:?string,locations:list<array{locationReference:string,locationName:?string}>,fetchedAt:string}
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the parcel carries several status texts or an unknown one.
+	 * @param  int  $cadastralDistrictIdentifier  Official ejerlav code.
+	 * @param  string  $landParcelIdentifier  Matrikelnummer.
+	 * @param  array<string,array{statusTexts:array<string,true>,locations:array<string,?string>}>  $parcels  Parsed parcels of the ejerlav, keyed by matrikelnummer.
+	 * @return SoilParcelStatus
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the parcel carries several status texts or an unknown one.
 	 */
 	private static function normalizeParcelStatus(
 		int $cadastralDistrictIdentifier,
@@ -388,7 +472,7 @@ final class SoilContamination extends BaseService {
 	/**
 	 * Return statuses in SoilContaminationStatus case order.
 	 *
-	 * @param array<string,bool> $statuses Status values as keys.
+	 * @param  array<string,bool>  $statuses  Status values as keys.
 	 * @return list<string>
 	 */
 	private static function orderedStatuses(array $statuses): array {
@@ -404,9 +488,10 @@ final class SoilContamination extends BaseService {
 	}
 
 	/**
-	 * Split one DKjord semicolon-separated source field into exact non-empty values.
+	 * Split a semicolon-separated DKjord field into its trimmed, non-empty values.
 	 *
-	 * @return list<string>
+	 * @param  string|null  $value
+	 * @return list<string>  Empty for null.
 	 */
 	private static function splitSemicolonList(?string $value): array {
 		if ($value === null) {
@@ -425,9 +510,16 @@ final class SoilContamination extends BaseService {
 	}
 
 	/**
-	 * Resolve the BFE type and the SFE whose parcels define its physical ground scope.
+	 * Find the property of a BFE number in Matriklen and the SFE whose parcels make up its ground.
 	 *
-	 * @return array{propertyType:string,propertyId:string,underlyingSfeId:?string}|null
+	 * Behavior:
+	 * - Looks for an SFE, a building on foreign ground (area, then point) and an owner apartment, in
+	 *   that order, and takes the first found.
+	 *
+	 * @param  int  $bfe  BFE number.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return array{propertyType:string,propertyId:string,underlyingSfeId:?string}|null  Null when Matriklen has no current property with the number.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed, or a lookup finds several current objects.
 	 */
 	private function resolveMatrikelProperty(int $bfe, string $effectiveAt): ?array {
 		$sfe = $this->fetchOne(
@@ -508,9 +600,12 @@ final class SoilContamination extends BaseService {
 	}
 
 	/**
-	 * Normalize one building-on-foreign-ground Matriklen node.
+	 * Normalize one Matriklen node of a building on foreign ground.
 	 *
+	 * @param  array<string,mixed>  $node  Raw node.
+	 * @param  string  $root  Connection name, for the exception message.
 	 * @return array{propertyType:string,propertyId:string,underlyingSfeId:?string}
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the node has no id or a value is invalid.
 	 */
 	private function normalizeBpfgProperty(array $node, string $root): array {
 		return [
@@ -521,9 +616,15 @@ final class SoilContamination extends BaseService {
 	}
 
 	/**
-	 * Load current parcels belonging to one SFE.
+	 * Return the current parcels of one SFE.
 	 *
-	 * @return list<array<string,mixed>>
+	 * Behavior:
+	 * - A parcel with a status counts only when the status is Gaeldende.
+	 *
+	 * @param  string  $sfeId  Matriklen id of the SFE.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return list<array<string,mixed>>  Raw MAT_Jordstykke nodes.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a request fails or a page is malformed.
 	 */
 	private function loadCurrentParcels(string $sfeId, string $effectiveAt): array {
 		$rows = $this->fetchAll(
@@ -544,10 +645,12 @@ final class SoilContamination extends BaseService {
 	}
 
 	/**
-	 * Load cadastral-district metadata for the returned parcels.
+	 * Return the ejerlav of parcels.
 	 *
-	 * @param list<array<string,mixed>> $parcels
-	 * @return array<string,array<string,mixed>> Rows keyed by id_lokalId.
+	 * @param  list<array<string,mixed>>  $parcels  Raw MAT_Jordstykke nodes.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return array<string,array<string,mixed>>  Raw MAT_Ejerlav nodes keyed by id_lokalId.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a request fails or a page is malformed.
 	 */
 	private function loadCadastralDistricts(array $parcels, string $effectiveAt): array {
 		$ids = [];
@@ -582,11 +685,11 @@ final class SoilContamination extends BaseService {
 	/**
 	 * Fetch the current version of at most one Matriklen object from one connection.
 	 *
-	 * @param string $root Connection name.
-	 * @param string $subject What the lookup asks for, such as "BFE 123"; names it in the exception message.
-	 * @param callable(?string):string $queryBuilder Cursor-aware query builder whose nodes select id_lokalId and status.
-	 * @return array<string,mixed>|null The node, or null when no current version matches.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When several current objects match, or a response is malformed.
+	 * @param  string  $root  Connection name.
+	 * @param  string  $subject  What the lookup asks for, such as "BFE 123"; names it in the exception message.
+	 * @param  callable(?string):string  $queryBuilder  Cursor-aware query builder whose nodes select id_lokalId and status.
+	 * @return array<string,mixed>|null  The node, or null when no current version matches.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a request fails, a response is malformed, or several current objects match.
 	 * @see \CitOmni\DanishPublicSectorData\Service\SoilContamination::currentNode()  Which node counts as current.
 	 */
 	private function fetchOne(string $root, string $subject, callable $queryBuilder): ?array {
@@ -601,11 +704,11 @@ final class SoilContamination extends BaseService {
 	 *   pending cadastral case (status Foreloebig) is ignored.
 	 * - Identical nodes count once.
 	 *
-	 * @param string $root Connection name.
-	 * @param string $subject What the lookup asks for; names it in the exception message.
-	 * @param list<array<string,mixed>> $nodes Nodes of the lookup.
-	 * @return array<string,mixed>|null The node, or null when no current version is left.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When several different current nodes remain.
+	 * @param  string  $root  Connection name.
+	 * @param  string  $subject  What the lookup asks for; names it in the exception message.
+	 * @param  list<array<string,mixed>>  $nodes  Nodes of the lookup.
+	 * @return array<string,mixed>|null  The node, or null when no current version is left.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When several different current nodes remain, or a status is not a scalar.
 	 */
 	private static function currentNode(string $root, string $subject, array $nodes): ?array {
 		$current = [];
@@ -634,10 +737,12 @@ final class SoilContamination extends BaseService {
 	}
 
 	/**
-	 * Fetch all pages from one Datafordeler current-state connection.
+	 * Return the nodes of every page of one Matriklen connection.
 	 *
-	 * @param callable(?string):string $queryBuilder Cursor-aware query builder.
-	 * @return list<array<string,mixed>>
+	 * @param  string  $root  Connection name.
+	 * @param  callable(?string):string  $queryBuilder  Builder of the query document for one page; its argument is the cursor of the previous page, null for the first.
+	 * @return list<array<string,mixed>>  Nodes in response order.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a request fails, or a page is malformed or announces a next page without a cursor.
 	 */
 	private function fetchAll(string $root, callable $queryBuilder): array {
 		$nodes = [];
@@ -689,6 +794,14 @@ final class SoilContamination extends BaseService {
 	// GraphQL current-state query builders
 	// ----------------------------------------------------------------
 
+	/**
+	 * Build the query document for one page of the SFE with a BFE number.
+	 *
+	 * @param  int  $bfe  BFE number.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 */
 	private function buildSfeByBfeQuery(int $bfe, string $effectiveAt, ?string $after): string {
 		$afterArg = self::afterArgument($after);
 
@@ -709,6 +822,14 @@ query SoilContaminationSfeByBfe {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the building on foreign ground (area) with a BFE number.
+	 *
+	 * @param  int  $bfe  BFE number.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 */
 	private function buildBpfgFladeByBfeQuery(int $bfe, string $effectiveAt, ?string $after): string {
 		$afterArg = self::afterArgument($after);
 
@@ -730,6 +851,14 @@ query SoilContaminationBpfgFladeByBfe {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the building on foreign ground (point) with a BFE number.
+	 *
+	 * @param  int  $bfe  BFE number.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 */
 	private function buildBpfgPunktByBfeQuery(int $bfe, string $effectiveAt, ?string $after): string {
 		$afterArg = self::afterArgument($after);
 
@@ -751,6 +880,14 @@ query SoilContaminationBpfgPunktByBfe {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the owner apartment with a BFE number.
+	 *
+	 * @param  int  $bfe  BFE number.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 */
 	private function buildOwnerApartmentByBfeQuery(int $bfe, string $effectiveAt, ?string $after): string {
 		$afterArg = self::afterArgument($after);
 
@@ -774,6 +911,15 @@ query SoilContaminationOwnerApartmentByBfe {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the building on foreign ground (area) with a Matriklen id.
+	 *
+	 * @param  string  $id  Matriklen id.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When the id cannot be encoded as a GraphQL string.
+	 */
 	private function buildBpfgFladeByIdQuery(string $id, string $effectiveAt, ?string $after): string {
 		$afterArg = self::afterArgument($after);
 		$id = self::gqlString($id);
@@ -796,6 +942,15 @@ query SoilContaminationBpfgFladeById {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the building on foreign ground (point) with a Matriklen id.
+	 *
+	 * @param  string  $id  Matriklen id.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When the id cannot be encoded as a GraphQL string.
+	 */
 	private function buildBpfgPunktByIdQuery(string $id, string $effectiveAt, ?string $after): string {
 		$afterArg = self::afterArgument($after);
 		$id = self::gqlString($id);
@@ -818,6 +973,15 @@ query SoilContaminationBpfgPunktById {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the parcels of an SFE.
+	 *
+	 * @param  string  $sfeId  Matriklen id of the SFE.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When the id cannot be encoded as a GraphQL string.
+	 */
 	private function buildParcelsBySfeQuery(string $sfeId, string $effectiveAt, ?string $after): string {
 		$afterArg = self::afterArgument($after);
 		$sfeId = self::gqlString($sfeId);
@@ -843,6 +1007,15 @@ query SoilContaminationParcelsBySfe {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of ejerlav by id.
+	 *
+	 * @param  list<string>  $ids  At most 100 Matriklen ids of ejerlav.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When the list is empty or an id cannot be encoded as a GraphQL string.
+	 */
 	private function buildCadastralDistrictsByIdsQuery(array $ids, string $effectiveAt, ?string $after): string {
 		$afterArg = self::afterArgument($after);
 		$ids = self::gqlStringList($ids);
@@ -867,7 +1040,9 @@ GRAPHQL;
 	}
 
 	/**
-	 * Return the common pageInfo GraphQL selection.
+	 * Return the pageInfo selection of a connection.
+	 *
+	 * @return string
 	 */
 	private function pageInfo(): string {
 		return <<<'GRAPHQL'
@@ -879,7 +1054,11 @@ GRAPHQL;
 	}
 
 	/**
-	 * Build an optional GraphQL cursor argument.
+	 * Build the after argument of a page request.
+	 *
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  Argument line with its leading line break, or an empty string for the first page.
+	 * @throws \InvalidArgumentException  When the cursor cannot be encoded as a GraphQL string.
 	 */
 	private static function afterArgument(?string $after): string {
 		return $after !== null
@@ -888,7 +1067,11 @@ GRAPHQL;
 	}
 
 	/**
-	 * Encode one GraphQL string literal.
+	 * Encode a string as a GraphQL string literal.
+	 *
+	 * @param  string  $value
+	 * @return string  A JSON string literal, which is also a GraphQL string literal.
+	 * @throws \InvalidArgumentException  When the string cannot be encoded as JSON, such as invalid UTF-8.
 	 */
 	private static function gqlString(string $value): string {
 		try {
@@ -899,9 +1082,11 @@ GRAPHQL;
 	}
 
 	/**
-	 * Encode one non-empty GraphQL string list.
+	 * Encode a non-empty list of strings as a GraphQL list literal.
 	 *
-	 * @param list<string> $values
+	 * @param  list<string>  $values
+	 * @return string
+	 * @throws \InvalidArgumentException  When the list is empty or a value cannot be encoded.
 	 */
 	private static function gqlStringList(array $values): string {
 		if ($values === []) {
@@ -915,7 +1100,14 @@ GRAPHQL;
 	}
 
 	/**
-	 * Return whether a Matriklen status marks the current version of an object.
+	 * Tell whether a Matriklen status marks the current version of an object.
+	 *
+	 * Behavior:
+	 * - True for Gaeldende in any letter case, after trimming. A Danish letter counts as its
+	 *   two-letter spelling (ae, oe, aa), so the spelling with the Danish letter matches too.
+	 *
+	 * @param  string  $status
+	 * @return bool
 	 */
 	private static function isCurrentStatus(string $status): bool {
 		$normalized = \strtr(\trim($status), [
@@ -932,6 +1124,11 @@ GRAPHQL;
 
 	/**
 	 * Normalize a positive integer without leading zeroes.
+	 *
+	 * @param  int|string  $value  Surrounding whitespace of a string is ignored.
+	 * @param  string  $label  Name of the value in exception messages.
+	 * @return int  At least 1.
+	 * @throws \InvalidArgumentException  When the value is not such an integer or exceeds the int range.
 	 */
 	private static function normalizePositiveInt(int|string $value, string $label): int {
 		$string = \is_int($value) ? (string)$value : \trim($value);
@@ -948,7 +1145,11 @@ GRAPHQL;
 	}
 
 	/**
-	 * Normalize one exact matrikelnummer.
+	 * Normalize one matrikelnummer.
+	 *
+	 * @param  string  $value  Surrounding whitespace is ignored.
+	 * @return string  The trimmed matrikelnummer.
+	 * @throws \InvalidArgumentException  When it is empty, longer than 64 bytes or holds a control character.
 	 */
 	private static function normalizeLandParcelIdentifier(string $value): string {
 		$value = \trim($value);
@@ -960,7 +1161,11 @@ GRAPHQL;
 	}
 
 	/**
-	 * Normalize a scalar to a nullable string.
+	 * Normalize an upstream scalar to trimmed text, or null.
+	 *
+	 * @param  mixed  $value  Raw upstream value.
+	 * @return string|null  Null for null and for text that is empty after trimming.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the value is neither null nor a string, int or float.
 	 */
 	private static function nullableString(mixed $value): ?string {
 		if ($value === null) {
@@ -975,7 +1180,12 @@ GRAPHQL;
 	}
 
 	/**
-	 * Normalize a required scalar string.
+	 * Normalize a required upstream scalar to trimmed, non-empty text.
+	 *
+	 * @param  mixed  $value  Raw upstream value.
+	 * @param  string  $field  Name of the field in exception messages.
+	 * @return string
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the value is missing, empty after trimming, or not a string, int or float.
 	 */
 	private static function requiredString(mixed $value, string $field): string {
 		$value = self::nullableString($value);
@@ -987,7 +1197,11 @@ GRAPHQL;
 	}
 
 	/**
-	 * Normalize a nullable integer.
+	 * Normalize an upstream integer, or null.
+	 *
+	 * @param  mixed  $value  Raw upstream value: An int, or a string of an integer.
+	 * @return int|null  Null for null and for an empty string.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the value is not an integer in the int range.
 	 */
 	private static function nullableInt(mixed $value): ?int {
 		if ($value === null || $value === '') {
@@ -1009,7 +1223,12 @@ GRAPHQL;
 	}
 
 	/**
-	 * Normalize a required integer.
+	 * Normalize a required upstream integer.
+	 *
+	 * @param  mixed  $value  Raw upstream value: An int, or a string of an integer.
+	 * @param  string  $field  Name of the field in exception messages.
+	 * @return int
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the value is missing or not an integer in the int range.
 	 */
 	private static function requiredInt(mixed $value, string $field): int {
 		$value = self::nullableInt($value);
@@ -1021,7 +1240,9 @@ GRAPHQL;
 	}
 
 	/**
-	 * Return an explicit UTC point-in-time for current-state source queries.
+	 * Return the current time in UTC as a Datafordeler effect time.
+	 *
+	 * @return string  Such as 2026-01-31T12:00:00Z.
 	 */
 	private static function now(): string {
 		return \gmdate('Y-m-d\TH:i:s\Z');

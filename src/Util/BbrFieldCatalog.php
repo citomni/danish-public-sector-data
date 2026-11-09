@@ -16,22 +16,19 @@ declare(strict_types=1);
 namespace CitOmni\DanishPublicSectorData\Util;
 
 /**
- * BbrFieldCatalog: Preserve normalized BBR fields not promoted to dedicated public keys.
+ * BbrFieldCatalog: Util that keeps the BBR fields that the bbr service has no key of its own for.
  *
- * Behavior:
- * - Describes BBR v3 domain fields that are queried but not mapped to dedicated normalized keys.
- * - Emits only non-null and non-empty values while preserving zero and false values.
- * - Adds bundled code-list labels when a field has a known BBR code list.
- * - Keeps upstream field identifiers as source metadata without exposing raw GraphQL payloads.
+ * Lets the bbr service return every BBR v3 domain field that it queries without a normalized key
+ * for each, so no queried value is lost. Which fields get a key of their own belongs to the bbr
+ * service, and the labels of codes to BbrCodeLists.
  *
- * Notes:
- * - This catalog is static runtime data generated from the bundled BBR v3 schema.
- * - GraphQL schema parsing never occurs during normal application requests.
- * - Dedicated normalized fields remain authoritative when a field is intentionally promoted.
+ * Rules:
+ * - Pure: Every result depends only on the arguments.
+ * - Never list a field that the bbr service gives a key of its own.
  */
-final class BbrFieldCatalog {
+class BbrFieldCatalog {
 
-	/** @var array<string,array<string,array{label:string,type:string,codeList:?string}>> */
+	/** @var array<string,array<string,array{label:string,type:string,codeList:?string}>> Fields of the bundled BBR v3 schema without a key of their own, by entity and field name: Label, value type and code list. */
 	private const array ADDITIONAL_FIELDS = [
 		'ground' => [
 			'gru025TilladelseTilUdtraeden' => ['label' => 'Tilladelse til udtræden', 'type' => 'code', 'codeList' => 'TilladelseTilUdtraeden'],
@@ -150,11 +147,22 @@ final class BbrFieldCatalog {
 	];
 
 	/**
-	 * Normalize additional fields for one BBR entity.
+	 * Return the catalog fields of one BBR node that hold a value.
 	 *
-	 * @param string $entity Catalog entity key.
-	 * @param array<string,mixed> $node Raw GraphQL node.
-	 * @return list<array{sourceField:string,label:string,type:string,value:mixed,valueLabel:?string}> Additional non-empty fields.
+	 * Behavior:
+	 * - One entry per catalog field of the entity that the node holds a value for, in catalog order.
+	 * - null and '' count as no value; 0 and false are kept.
+	 * - A coordinate becomes crs and wkt. It counts as no value when it is not an object or has
+	 *   neither.
+	 * - valueLabel is the label of a coded value from BbrCodeLists, or null.
+	 *
+	 * Typical usage:
+	 *   $fields = BbrFieldCatalog::normalizeAdditionalFields('building', $node);
+	 *
+	 * @param  string  $entity  ground, building, unit, floor, entrance or technicalInstallation.
+	 * @param  array<string,mixed>  $node  Raw GraphQL node of that entity.
+	 * @return list<array{sourceField:string,label:string,type:string,value:mixed,valueLabel:?string}>  sourceField is the BBR field name.
+	 * @throws \LogicException  When the entity is not in the catalog.
 	 */
 	public static function normalizeAdditionalFields(string $entity, array $node): array {
 		$catalog = self::ADDITIONAL_FIELDS[$entity] ?? null;

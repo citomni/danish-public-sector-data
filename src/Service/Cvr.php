@@ -20,28 +20,15 @@ use CitOmni\DanishPublicSectorData\Support\DatafordelerClient;
 use CitOmni\Kernel\Service\BaseService;
 
 /**
- * Cvr: Read normalized Danish company and production-unit data from the official CVR register.
+ * Cvr: Service that reads companies and production units from the Danish CVR register.
  *
- * Behavior:
- * - Looks up companies by eight-digit CVR number and production units by ten-digit P-number
- *   through Datafordeler flexibleCurrent, one number at a time or many per call.
- * - Returns normalized identity, status, addresses, contact data, and industries for companies
- *   and production units alike, plus the company form for companies.
- * - Returns a company with its production units when the caller asks for them, and a
- *   production unit with the CVR number of its company.
- * - Returns the latest number of employees of companies and production units through calls of
- *   their own, which read only the employment figures.
- * - Prefers the registered location address and keeps the explicit postal address separately.
- * - Returns null for a number without a matching company or production unit.
+ * Gives host apps CVR data by CVR number or P-number as package-owned arrays: The GraphQL
+ * relations of Datafordeler stay inside, and the result shapes do not follow its schema.
+ * Authentication and transport belong to DatafordelerClient.
  *
- * Notes:
- * - Datafordeler-specific GraphQL relation names are contained inside this service.
- * - The public result shapes are intentionally independent of the upstream GraphQL schema.
- * - Only non-access-restricted CVR data is queried.
- *
- * Typical usage:
- *   $company = $this->app->cvr->getCompany('12345678');
- *   $units = $this->app->cvr->getProductionUnits(['1234567890', '1234567891']);
+ * Rules:
+ * - Query only CVR data that is not access-restricted.
+ * - Return what CVR holds; never fill a value in from another register.
  *
  * @phpstan-type CvrAddress array{
  *     type:?string,
@@ -102,11 +89,8 @@ use CitOmni\Kernel\Service\BaseService;
  *     periodStart:string,
  *     periodEnd:string
  * }
- *
- * @throws \InvalidArgumentException When a CVR number or P-number is malformed.
- * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When the remote lookup fails.
  */
-final class Cvr extends BaseService {
+class Cvr extends BaseService {
 
 	/** Maximum number of identifiers in one in filter, and the page size of a lookup by identifiers. */
 	private const int IDENTIFIER_BATCH_SIZE = 100; // Datafordeler accepts at most 100 values in an in filter.
@@ -172,15 +156,21 @@ final class Cvr extends BaseService {
 					}
 GRAPHQL;
 
+	/** Datafordeler client that authenticates with the API key. */
 	private DatafordelerClient $datafordeler;
+
+	/** Datafordeler service that serves CVR. */
 	private string $service;
+
+	/** Version of that service. */
 	private string $version;
 
 	/**
-	 * Load the package-owned CVR endpoint selection.
+	 * Read the CVR endpoint from cfg and create the Datafordeler client.
 	 *
 	 * @return void
-	 * @throws \UnexpectedValueException When endpoint configuration is invalid.
+	 * @throws \UnexpectedValueException  When cfg danish_public_sector_data.cvr.service or .version is empty, or the Datafordeler cfg is invalid.
+	 * @see \CitOmni\Kernel\Service\BaseService::__construct()  Calls it once per instance.
 	 */
 	protected function init(): void {
 		$cfg = $this->app->cfg->danish_public_sector_data->cvr;
@@ -200,45 +190,48 @@ GRAPHQL;
 	// ----------------------------------------------------------------
 
 	/**
-	 * Return one normalized CVR company record.
+	 * Return one company by CVR number.
 	 *
 	 * Typical usage:
 	 *   $company = $this->app->cvr->getCompany('12345678');
 	 *   $company = $this->app->cvr->getCompany('12345678', withProductionUnits: true);
 	 *
-	 * @param int|string $cvrNumber Eight digits, the first of them 1-9.
-	 * @param bool $withProductionUnits True also loads the company's production units into productionUnits.
-	 * @return CvrCompany|null Normalized company data, or null when Datafordeler has no company with the number.
-	 * @throws \InvalidArgumentException When the CVR number does not have eight digits or starts with 0.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When the remote lookup fails or is malformed.
-	 * @see \CitOmni\DanishPublicSectorData\Service\Cvr::getCompanies() The requests behind the lookup and what productionUnits holds.
+	 * @param  int|string  $cvrNumber  Eight digits, the first of them 1-9.
+	 * @param  bool  $withProductionUnits  True also loads the company's production units into productionUnits.
+	 * @return CvrCompany|null  Null when Datafordeler has no company with the number.
+	 * @throws \InvalidArgumentException  When the CVR number does not have eight digits or starts with 0.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When the remote lookup fails or is malformed.
+	 * @see \CitOmni\DanishPublicSectorData\Service\Cvr::getCompanies()  The requests behind the lookup and what the record holds.
 	 */
 	public function getCompany(int|string $cvrNumber, bool $withProductionUnits = false): ?array {
 		return $this->getCompanies([$cvrNumber], $withProductionUnits)[(int)$cvrNumber];
 	}
 
 	/**
-	 * Return normalized CVR company records for many CVR numbers.
+	 * Return the companies of many CVR numbers.
 	 *
 	 * Behavior:
 	 * - Returns one entry per distinct CVR number, keyed by that number in the order the numbers
 	 *   first occur. An entry is null when Datafordeler has no company with the number.
-	 * - Sends the numbers in batches of up to 100. A batch takes one request per page of up to
-	 *   100 companies and, with production units and at least one company found, one request per
-	 *   page of up to 1000 production units of the companies found.
+	 * - address is the location address (beliggenhedsadresse), or the postal address when CVR has
+	 *   none; postalAddress is the postal address. address.formatted is built from the address
+	 *   fields.
 	 * - productionUnits holds the production units that Datafordeler attaches to the company,
 	 *   unfiltered by status or end date and ordered by P-number. It is null when
 	 *   $withProductionUnits is false.
+	 * - Sends the numbers in batches of up to 100. A batch takes one request per page of up to
+	 *   100 companies and, with production units and at least one company found, one request per
+	 *   page of up to 1000 production units of the companies found.
 	 * - Every request of one call uses the same effect time: the time of the call.
 	 *
 	 * Typical usage:
 	 *   $companies = $this->app->cvr->getCompanies(['12345678', '87654321'], withProductionUnits: true);
 	 *
-	 * @param array<array-key,int|string> $cvrNumbers CVR numbers of eight digits, the first of them 1-9. A repeated number is looked up once.
-	 * @param bool $withProductionUnits True also loads the production units of the companies into productionUnits.
-	 * @return array<int,CvrCompany|null> Normalized company data keyed by CVR number.
-	 * @throws \InvalidArgumentException When a CVR number is not an int or string of eight digits starting with 1-9.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When a remote lookup fails or is malformed.
+	 * @param  array<array-key,int|string>  $cvrNumbers  CVR numbers of eight digits, the first of them 1-9. A repeated number is looked up once.
+	 * @param  bool  $withProductionUnits  True also loads the production units of the companies into productionUnits.
+	 * @return array<int,CvrCompany|null>  Companies keyed by CVR number.
+	 * @throws \InvalidArgumentException  When a CVR number is not an int or string of eight digits starting with 1-9.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a remote lookup fails or is malformed.
 	 */
 	public function getCompanies(array $cvrNumbers, bool $withProductionUnits = false): array {
 		$requested = self::lookupNumbers(
@@ -312,39 +305,42 @@ GRAPHQL;
 	}
 
 	/**
-	 * Return one normalized CVR production-unit record.
+	 * Return one production unit by P-number.
 	 *
 	 * Typical usage:
 	 *   $unit = $this->app->cvr->getProductionUnit('1234567890');
 	 *
-	 * @param int|string $pNumber Ten digits, the first of them 1-9.
-	 * @return CvrProductionUnit|null Normalized production-unit data, or null when Datafordeler has no production unit with the number.
-	 * @throws \InvalidArgumentException When the P-number does not have ten digits or starts with 0.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When the remote lookup fails or is malformed.
-	 * @see \CitOmni\DanishPublicSectorData\Service\Cvr::getProductionUnits() The requests behind the lookup.
+	 * @param  int|string  $pNumber  Ten digits, the first of them 1-9.
+	 * @return CvrProductionUnit|null  Null when Datafordeler has no production unit with the number.
+	 * @throws \InvalidArgumentException  When the P-number does not have ten digits or starts with 0.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When the remote lookup fails or is malformed.
+	 * @see \CitOmni\DanishPublicSectorData\Service\Cvr::getProductionUnits()  The requests behind the lookup and what the record holds.
 	 */
 	public function getProductionUnit(int|string $pNumber): ?array {
 		return $this->getProductionUnits([$pNumber])[(int)$pNumber];
 	}
 
 	/**
-	 * Return normalized CVR production-unit records for many P-numbers.
+	 * Return the production units of many P-numbers.
 	 *
 	 * Behavior:
 	 * - Returns one entry per distinct P-number, keyed by that number in the order the numbers
 	 *   first occur. An entry is null when Datafordeler has no production unit with the number.
+	 * - cvrNumber of a record is the company that the production unit is attached to.
+	 * - address is the location address (beliggenhedsadresse), or the postal address when CVR has
+	 *   none; postalAddress is the postal address. address.formatted is built from the address
+	 *   fields.
 	 * - Sends the numbers in batches of up to 100. A batch takes one request per page of up to
 	 *   100 production units.
-	 * - cvrNumber of a record is the company that the production unit is attached to.
 	 * - Every request of one call uses the same effect time: the time of the call.
 	 *
 	 * Typical usage:
 	 *   $units = $this->app->cvr->getProductionUnits(['1234567890', '1234567891']);
 	 *
-	 * @param array<array-key,int|string> $pNumbers P-numbers of ten digits, the first of them 1-9. A repeated number is looked up once.
-	 * @return array<int,CvrProductionUnit|null> Normalized production-unit data keyed by P-number.
-	 * @throws \InvalidArgumentException When a P-number is not an int or string of ten digits starting with 1-9.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When a remote lookup fails or is malformed.
+	 * @param  array<array-key,int|string>  $pNumbers  P-numbers of ten digits, the first of them 1-9. A repeated number is looked up once.
+	 * @return array<int,CvrProductionUnit|null>  Production units keyed by P-number.
+	 * @throws \InvalidArgumentException  When a P-number is not an int or string of ten digits starting with 1-9.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a remote lookup fails or is malformed.
 	 */
 	public function getProductionUnits(array $pNumbers): array {
 		$requested = self::lookupNumbers(
@@ -401,11 +397,11 @@ GRAPHQL;
 	 * Typical usage:
 	 *   $employees = $this->app->cvr->getCompanyEmployees(['12345678', '87654321']);
 	 *
-	 * @param array<array-key,int|string> $cvrNumbers CVR numbers of eight digits, the first of them 1-9. A repeated number is looked up once.
-	 * @return array<int,CvrEmployees|null> Latest employee figure keyed by CVR number.
-	 * @throws \InvalidArgumentException When a CVR number is not an int or string of eight digits starting with 1-9.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When a remote lookup fails or is malformed.
-	 * @see \CitOmni\DanishPublicSectorData\Service\Cvr::getProductionUnitEmployees() Which figure is the latest, and what it holds.
+	 * @param  array<array-key,int|string>  $cvrNumbers  CVR numbers of eight digits, the first of them 1-9. A repeated number is looked up once.
+	 * @return array<int,CvrEmployees|null>  Latest employee figure keyed by CVR number.
+	 * @throws \InvalidArgumentException  When a CVR number is not an int or string of eight digits starting with 1-9.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a remote lookup fails or is malformed.
+	 * @see \CitOmni\DanishPublicSectorData\Service\Cvr::getProductionUnitEmployees()  Which figure is the latest, and what it holds.
 	 */
 	public function getCompanyEmployees(array $cvrNumbers): array {
 		return $this->employees(
@@ -444,10 +440,10 @@ GRAPHQL;
 	 * Typical usage:
 	 *   $employees = $this->app->cvr->getProductionUnitEmployees(['1234567890', '1234567891']);
 	 *
-	 * @param array<array-key,int|string> $pNumbers P-numbers of ten digits, the first of them 1-9. A repeated number is looked up once.
-	 * @return array<int,CvrEmployees|null> Latest employee figure keyed by P-number.
-	 * @throws \InvalidArgumentException When a P-number is not an int or string of ten digits starting with 1-9.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When a remote lookup fails or is malformed.
+	 * @param  array<array-key,int|string>  $pNumbers  P-numbers of ten digits, the first of them 1-9. A repeated number is looked up once.
+	 * @return array<int,CvrEmployees|null>  Latest employee figure keyed by P-number.
+	 * @throws \InvalidArgumentException  When a P-number is not an int or string of ten digits starting with 1-9.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a remote lookup fails or is malformed.
 	 */
 	public function getProductionUnitEmployees(array $pNumbers): array {
 		return $this->employees(
@@ -464,12 +460,12 @@ GRAPHQL;
 	/**
 	 * Return the latest employee figure of every requested company or production unit.
 	 *
-	 * @param string $root CVR_Virksomhed or CVR_Produktionsenhed.
-	 * @param string $numberField CVRNummer or pNummer: The field of the root type that holds the requested numbers.
-	 * @param list<int> $requested Distinct, validated numbers.
-	 * @return array<int,CvrEmployees|null> Latest figure keyed by number, in the order of $requested.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When a remote lookup fails or is malformed.
-	 * @see \CitOmni\DanishPublicSectorData\Service\Cvr::getProductionUnitEmployees() Which figure is the latest.
+	 * @param  string  $root  CVR_Virksomhed or CVR_Produktionsenhed.
+	 * @param  string  $numberField  CVRNummer or pNummer: The field of the root type that holds the requested numbers.
+	 * @param  list<int>  $requested  Distinct, validated numbers.
+	 * @return array<int,CvrEmployees|null>  Latest figure keyed by number, in the order of $requested.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a remote lookup fails or is malformed.
+	 * @see \CitOmni\DanishPublicSectorData\Service\Cvr::getProductionUnitEmployees()  Which figure is the latest.
 	 */
 	private function employees(string $root, string $numberField, array $requested): array {
 		if ($requested === []) {
@@ -540,10 +536,10 @@ GRAPHQL;
 	 * - Yields the nodes in response order, one page at a time.
 	 * - Requests the next page only when the nodes of the current page have been consumed.
 	 *
-	 * @param string $root Root field of the query documents.
-	 * @param callable(?string):string $query Builder of the query document for one page; its argument is the cursor of the previous page, null for the first.
-	 * @return \Generator<int,array<string,mixed>,mixed,void> Nodes of every page.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When a page is malformed or announces a cursor that was already used.
+	 * @param  string  $root  Root field of the query documents.
+	 * @param  callable(?string):string  $query  Builder of the query document for one page; its argument is the cursor of the previous page, null for the first.
+	 * @return \Generator<int,array<string,mixed>,mixed,void>  Nodes of every page.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a request fails, or a page is malformed or announces a cursor that was already used.
 	 */
 	private function connectionNodes(string $root, callable $query): \Generator {
 		$cursor = null;
@@ -589,10 +585,10 @@ GRAPHQL;
 	/**
 	 * Build the query document for one page of companies.
 	 *
-	 * @param list<int> $cvrNumbers At most 100 CVR numbers.
-	 * @param string $effectiveAt UTC effect time in the form 2026-01-31T12:00:00Z.
-	 * @param string|null $after Cursor of the previous page, or null for the first page.
-	 * @return string GraphQL query document.
+	 * @param  list<int>  $cvrNumbers  At most 100 CVR numbers.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
 	 */
 	private static function companiesQuery(array $cvrNumbers, string $effectiveAt, ?string $after): string {
 		$first = self::IDENTIFIER_BATCH_SIZE;
@@ -634,12 +630,12 @@ GRAPHQL;
 	/**
 	 * Build the query document for one page of production units.
 	 *
-	 * @param string $filterField pNummer to select units by P-number, or tilknyttetVirksomhedsCVRNummer to select them by company.
-	 * @param list<int> $numbers At most 100 values of the filter field.
-	 * @param int $first Page size, 1 to 1000.
-	 * @param string $effectiveAt UTC effect time in the form 2026-01-31T12:00:00Z.
-	 * @param string|null $after Cursor of the previous page, or null for the first page.
-	 * @return string GraphQL query document.
+	 * @param  string  $filterField  pNummer to select units by P-number, or tilknyttetVirksomhedsCVRNummer to select them by company.
+	 * @param  list<int>  $numbers  At most 100 values of the filter field.
+	 * @param  int  $first  Page size, 1 to 1000.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
 	 */
 	private static function productionUnitsQuery(string $filterField, array $numbers, int $first, string $effectiveAt, ?string $after): string {
 		$afterArgument = self::afterArgument($after);
@@ -679,12 +675,12 @@ GRAPHQL;
 	/**
 	 * Build the query document for one page of the CVR entity ids of companies or production units.
 	 *
-	 * @param string $root CVR_Virksomhed or CVR_Produktionsenhed.
-	 * @param string $numberField CVRNummer or pNummer: The field of the root type that holds the numbers.
-	 * @param list<int> $numbers At most 100 numbers.
-	 * @param string $effectiveAt UTC effect time in the form 2026-01-31T12:00:00Z.
-	 * @param string|null $after Cursor of the previous page, or null for the first page.
-	 * @return string GraphQL query document.
+	 * @param  string  $root  CVR_Virksomhed or CVR_Produktionsenhed.
+	 * @param  string  $numberField  CVRNummer or pNummer: The field of the root type that holds the numbers.
+	 * @param  list<int>  $numbers  At most 100 numbers.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
 	 */
 	private static function entityIdsQuery(string $root, string $numberField, array $numbers, string $effectiveAt, ?string $after): string {
 		$first = self::IDENTIFIER_BATCH_SIZE;
@@ -714,10 +710,10 @@ GRAPHQL;
 	/**
 	 * Build the query document for one page of the employment figures of CVR entities.
 	 *
-	 * @param list<string> $entityIds At most 100 CVR entity ids.
-	 * @param string $effectiveAt UTC effect time in the form 2026-01-31T12:00:00Z.
-	 * @param string|null $after Cursor of the previous page, or null for the first page.
-	 * @return string GraphQL query document.
+	 * @param  list<string>  $entityIds  At most 100 CVR entity ids.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
 	 */
 	private static function employmentQuery(array $entityIds, string $effectiveAt, ?string $after): string {
 		$first = self::PAGE_SIZE;
@@ -758,8 +754,8 @@ GRAPHQL;
 	/**
 	 * Build the after argument of a page request.
 	 *
-	 * @param string|null $after Cursor of the previous page, or null for the first page.
-	 * @return string Argument line with its leading line break, or an empty string for the first page.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  Argument line with its leading line break, or an empty string for the first page.
 	 */
 	private static function afterArgument(?string $after): string {
 		if ($after === null) {
@@ -773,11 +769,11 @@ GRAPHQL;
 	/**
 	 * Validate lookup numbers and drop repeats.
 	 *
-	 * @param array<array-key,mixed> $numbers Requested numbers.
-	 * @param string $pattern Pattern that the decimal form of every number must match.
-	 * @param string $message Exception message for a number that does not match.
-	 * @return list<int> Distinct numbers in the order they first occur.
-	 * @throws \InvalidArgumentException When a number is neither an int nor a string, or its decimal form does not match the pattern.
+	 * @param  array<array-key,mixed>  $numbers  Requested numbers.
+	 * @param  string  $pattern  Pattern that the decimal form of every number must match.
+	 * @param  string  $message  Exception message for a number that does not match.
+	 * @return list<int>  Distinct numbers in the order they first occur.
+	 * @throws \InvalidArgumentException  When a number is neither an int nor a string, or its decimal form does not match the pattern.
 	 */
 	private static function lookupNumbers(array $numbers, string $pattern, string $message): array {
 		$unique = [];
@@ -802,9 +798,9 @@ GRAPHQL;
 	/**
 	 * Normalize one CVR_Virksomhed node.
 	 *
-	 * @param array<string,mixed> $node Raw company node.
-	 * @return CvrCompany Normalized company with productionUnits null.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the node shape or a value is invalid.
+	 * @param  array<string,mixed>  $node  Raw company node.
+	 * @return CvrCompany  The company with productionUnits null.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the node shape or a value is invalid.
 	 */
 	private function normalizeCompany(array $node): array {
 		$cvrNumber = self::requiredInt($node['CVRNummer'] ?? null, 'company CVR number');
@@ -828,9 +824,9 @@ GRAPHQL;
 	/**
 	 * Normalize one CVR_Produktionsenhed node.
 	 *
-	 * @param array<string,mixed> $node Raw production-unit node.
-	 * @return CvrProductionUnit Normalized production unit.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the node shape or a value is invalid.
+	 * @param  array<string,mixed>  $node  Raw production-unit node.
+	 * @return CvrProductionUnit
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the node shape or a value is invalid.
 	 */
 	private function normalizeProductionUnit(array $node): array {
 		$pNumber = self::requiredInt($node['pNummer'] ?? null, 'production unit P-number');
@@ -854,11 +850,11 @@ GRAPHQL;
 	}
 
 	/**
-	 * Normalize the name, addresses, contact data, and industries of one CVR entity relation.
+	 * Normalize the name, addresses, contact data and industries of one CVR entity relation.
 	 *
-	 * @param mixed $relation Raw CVR_CVREnhed connection.
-	 * @return CvrEntity Normalized entity data; every value is empty when the relation has no node.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the relation shape or a value is invalid.
+	 * @param  mixed  $relation  Raw CVR_CVREnhed connection.
+	 * @return CvrEntity  Every value empty when the relation has no node.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the relation shape or a value is invalid.
 	 */
 	private function normalizeEntity(mixed $relation): array {
 		$entity = $this->firstConnectionNode($relation, 'CVR entity relation');
@@ -900,12 +896,12 @@ GRAPHQL;
 	}
 
 	/**
-	 * Return the first node from a GraphQL connection relation.
+	 * Return the first node of a GraphQL connection relation.
 	 *
-	 * @param mixed $relation Raw relation value.
-	 * @param string $label Safe relation label for diagnostics.
-	 * @return array<string,mixed>|null First node or null when the connection is empty or absent.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the relation shape is invalid.
+	 * @param  mixed  $relation  Raw relation value.
+	 * @param  string  $label  Safe relation label for diagnostics.
+	 * @return array<string,mixed>|null  Null when the connection is absent or empty.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the relation shape is invalid.
 	 */
 	private function firstConnectionNode(mixed $relation, string $label): ?array {
 		if ($relation === null) {
@@ -932,16 +928,15 @@ GRAPHQL;
 	}
 
 	/**
-	 * Normalize the registered location and postal addresses from one CVR relation.
+	 * Normalize the location and postal addresses of one CVR address relation.
 	 *
 	 * Behavior:
-	 * - Keeps the explicit postal address separately when CVR supplies one.
-	 * - Preserves the historical public address behavior by falling back to the postal address
-	 *   when no registered location address is available.
+	 * - address is the first location address (beliggenhedsadresse), or the first postal address
+	 *   when there is none; postalAddress is the first postal address.
 	 *
-	 * @param mixed $relation Raw address relation.
-	 * @return array{address:CvrAddress|null,postalAddress:CvrAddress|null} Normalized address set.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the relation shape is invalid.
+	 * @param  mixed  $relation  Raw address relation.
+	 * @return array{address:CvrAddress|null,postalAddress:CvrAddress|null}
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the relation shape or a value is invalid.
 	 */
 	private function normalizeAddresses(mixed $relation): array {
 		if ($relation === null) {
@@ -980,8 +975,9 @@ GRAPHQL;
 	/**
 	 * Normalize one CVR address node.
 	 *
-	 * @param array<string,mixed> $node Raw address node.
-	 * @return CvrAddress Normalized address.
+	 * @param  array<string,mixed>  $node  Raw address node.
+	 * @return CvrAddress
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When a value is not null, a string, an int or a float.
 	 */
 	private function normalizeAddressNode(array $node): array {
 		$address = [
@@ -1006,19 +1002,20 @@ GRAPHQL;
 	}
 
 	/**
-	 * Build a human-readable single-line address from normalized CVR address fields.
+	 * Build a single-line display address from normalized CVR address fields.
 	 *
 	 * Behavior:
-	 * - Uses addressFritekst when CVR supplies an unstructured address.
-	 * - Otherwise combines the structured street, unit, locality and postal fields.
-	 * - Omits the Danish country code but appends non-Danish country codes when present.
+	 * - Uses freeText when CVR supplies an unstructured address.
+	 * - Otherwise joins the street with the house number or range, the floor and door, the
+	 *   supplementary city, and the postal code with the city, separated by commas.
+	 * - Appends the country code unless it is DK.
 	 *
 	 * Notes:
-	 * - The upstream Adresse field is a DAR address reference, not formatted address text.
-	 * - No external address lookup is required.
+	 * - CVR's own Adresse field is a DAR address reference, not display text, so the address is
+	 *   built here without a lookup.
 	 *
-	 * @param CvrAddress $address Normalized CVR address fields.
-	 * @return string|null Single-line display address, or null when no address text can be built.
+	 * @param  CvrAddress  $address  Normalized address; formatted is not read.
+	 * @return string|null  Null when no address text can be built.
 	 */
 	private static function formatAddress(array $address): ?string {
 		$countryCode = $address['countryCode'];
@@ -1083,12 +1080,12 @@ GRAPHQL;
 	}
 
 	/**
-	 * Normalize a to-one CVR relation containing a string value.
+	 * Normalize a to-one CVR relation that holds a string value.
 	 *
-	 * @param mixed $relation Raw relation value.
-	 * @param string $label Safe relation label for diagnostics.
-	 * @return string|null Normalized relation value.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the relation shape is invalid.
+	 * @param  mixed  $relation  Raw relation value.
+	 * @param  string  $label  Safe relation label for diagnostics.
+	 * @return string|null  Null when the relation is absent.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the relation shape is invalid or its value is missing.
 	 */
 	private function normalizeValueRelation(mixed $relation, string $label): ?string {
 		if ($relation === null) {
@@ -1104,9 +1101,9 @@ GRAPHQL;
 	/**
 	 * Normalize the CVR marketing-protection relation.
 	 *
-	 * @param mixed $relation Raw relation value.
-	 * @return bool|null Protection flag, or null when the relation is unavailable.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the relation shape or value is invalid.
+	 * @param  mixed  $relation  Raw relation value.
+	 * @return bool|null  Null when the relation is absent.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the relation shape is invalid or its value is not a boolean.
 	 */
 	private function normalizeBooleanValueRelation(mixed $relation): ?bool {
 		if ($relation === null) {
@@ -1129,16 +1126,15 @@ GRAPHQL;
 	}
 
 	/**
-	 * Normalize current CVR branch data into primary and secondary industries.
+	 * Normalize CVR industries into the primary industry and the secondary industries.
 	 *
-	 * Notes:
-	 * - CVR sequence 0 is the primary industry.
-	 * - Sequences 1 through 3 are secondary industries.
-	 * - Results are sorted by sequence so the public output is deterministic.
+	 * Behavior:
+	 * - Sequence 0 is the primary industry; sequences 1 to 3 are the secondary industries, ordered by
+	 *   sequence.
 	 *
-	 * @param mixed $relation Raw branch connection.
-	 * @return CvrIndustries Normalized industries.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the relation shape or node values are invalid.
+	 * @param  mixed  $relation  Raw industry connection.
+	 * @return CvrIndustries
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the relation shape or a value is invalid, a sequence is outside 0 to 3, or a sequence repeats.
 	 */
 	private function normalizeIndustries(mixed $relation): array {
 		if ($relation === null) {
@@ -1203,9 +1199,9 @@ GRAPHQL;
 	/**
 	 * Normalize the CVR company-form relation.
 	 *
-	 * @param mixed $relation Raw company-form relation.
-	 * @return array{code:?string,name:?string}|null Normalized company form or null when unavailable.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the relation shape is invalid.
+	 * @param  mixed  $relation  Raw company-form relation.
+	 * @return array{code:?string,name:?string}|null  Null when the relation is absent.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the relation shape or a value is invalid.
 	 */
 	private function normalizeCompanyType(mixed $relation): ?array {
 		if ($relation === null) {
@@ -1229,9 +1225,9 @@ GRAPHQL;
 	 *   getProductionUnitEmployees() defines it. Figures that would tie are ordered by their
 	 *   values, so the choice does not depend on the order of the response.
 	 *
-	 * @param array<string,mixed> $node Raw employment node.
-	 * @return array{rank:list<int|string>,employees:CvrEmployees}|null Normalized figure and its rank, or null when the figure counts something else, such as full-time equivalents, or holds no number.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the type is missing, or a value of a figure that counts employees is invalid.
+	 * @param  array<string,mixed>  $node  Raw employment node.
+	 * @return array{rank:list<int|string>,employees:CvrEmployees}|null  Null when the figure counts something else, such as full-time equivalents, or holds no number.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the type is missing, or a value of a figure that counts employees is invalid.
 	 */
 	private static function employeeFigure(array $node): ?array {
 		$type = self::requiredString($node['beskaeftigelsestalstype'] ?? null, 'employment type');
@@ -1283,10 +1279,10 @@ GRAPHQL;
 	/**
 	 * Normalize a required upstream scalar to a non-empty string.
 	 *
-	 * @param mixed $value Raw upstream value.
-	 * @param string $label Safe value label for diagnostics.
-	 * @return string Non-empty string value.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the value is missing or invalid.
+	 * @param  mixed  $value  Raw upstream value.
+	 * @param  string  $label  Safe value label for diagnostics.
+	 * @return string  Never empty.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the value is missing, empty, or not a string, int or float.
 	 */
 	private static function requiredString(mixed $value, string $label): string {
 		$normalized = self::nullableString($value);
@@ -1300,10 +1296,10 @@ GRAPHQL;
 	/**
 	 * Normalize a required upstream integer.
 	 *
-	 * @param mixed $value Raw upstream value.
-	 * @param string $label Safe value label for diagnostics.
-	 * @return int Integer value.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the value is missing or invalid.
+	 * @param  mixed  $value  Raw upstream value: An int, or a string of an integer in the int range.
+	 * @param  string  $label  Safe value label for diagnostics.
+	 * @return int
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the value is missing or not an integer.
 	 */
 	private static function requiredInt(mixed $value, string $label): int {
 		if (\is_int($value)) {
@@ -1317,11 +1313,11 @@ GRAPHQL;
 	}
 
 	/**
-	 * Normalize an upstream scalar to a nullable string.
+	 * Normalize an upstream scalar to a string, or null.
 	 *
-	 * @param mixed $value Raw upstream value.
-	 * @return string|null String value or null.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the value is not scalar or null.
+	 * @param  mixed  $value  Raw upstream value.
+	 * @return string|null  Null for null.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the value is neither null nor a string, int or float.
 	 */
 	private static function nullableString(mixed $value): ?string {
 		if ($value === null) {
@@ -1337,10 +1333,10 @@ GRAPHQL;
 	/**
 	 * Normalize a nullable upstream count.
 	 *
-	 * @param mixed $value Raw upstream value.
-	 * @param string $label Safe value label for diagnostics.
-	 * @return int|null Count of at least 0, or null when the value is null.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the value is neither null nor an integer of at least 0.
+	 * @param  mixed  $value  Raw upstream value.
+	 * @param  string  $label  Safe value label for diagnostics.
+	 * @return int|null  Count of at least 0, or null for null.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the value is neither null nor an integer of at least 0.
 	 */
 	private static function nullableCount(mixed $value, string $label): ?int {
 		if ($value === null) {
@@ -1358,10 +1354,10 @@ GRAPHQL;
 	/**
 	 * Normalize a required upstream date.
 	 *
-	 * @param mixed $value Raw upstream value.
-	 * @param string $label Safe value label for diagnostics.
-	 * @return string Date that exists, as YYYY-MM-DD.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the value is not a date that exists, written as YYYY-MM-DD.
+	 * @param  mixed  $value  Raw upstream value.
+	 * @param  string  $label  Safe value label for diagnostics.
+	 * @return string  Date that exists, as YYYY-MM-DD.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the value is not a date that exists, written as YYYY-MM-DD.
 	 */
 	private static function requiredDate(mixed $value, string $label): string {
 		if (
@@ -1378,10 +1374,10 @@ GRAPHQL;
 	/**
 	 * Normalize a required upstream timestamp to UTC text that sorts in time order.
 	 *
-	 * @param mixed $value Raw upstream value, such as 2026-03-31T09:23:30.000000+02:00.
-	 * @param string $label Safe value label for diagnostics.
-	 * @return string The time in UTC, as Y-m-d H:i:s.u.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the value is missing or not a time.
+	 * @param  mixed  $value  Raw upstream value, such as 2026-03-31T09:23:30.000000+02:00.
+	 * @param  string  $label  Safe value label for diagnostics.
+	 * @return string  The time in UTC, as Y-m-d H:i:s.u.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the value is missing or not a time.
 	 */
 	private static function utcTime(mixed $value, string $label): string {
 		if (!\is_string($value) || $value === '') {

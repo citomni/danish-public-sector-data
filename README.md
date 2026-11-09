@@ -139,10 +139,11 @@ $history = $this->app->bbr->getTechnicalInstallationHistory('4268969');
 This keeps normal current-state lookups cheaper while still allowing due-diligence workflows to
 inspect historical BBR technical installations such as former tanks.
 
-Address parsing and deterministic fuzzy-street matching have a local smoke test:
+Address parsing, deterministic fuzzy-street matching, normalization, the bundled code lists
+and the field coverage of the queries have a local suite that makes no network requests:
 
 ```bash
-php tests/bbr_address_parser_test.php
+php tests/bbr/run.php
 ```
 
 ## Soil contamination lookup
@@ -176,10 +177,10 @@ $result = $this->app->soilContamination->getByBfe(3208712);
 
 The BFE lookup supports SFE, building-on-foreign-ground, and owner-apartment properties when an underlying SFE exists. It loads current Matriklen parcels, resolves their official ejerlav identifiers, attaches the `getByParcel()` result as `contamination` to every parcel, and returns the distinct parcel statuses in `statuses`. A property without an underlying SFE can return `parcelResolutionStatus=no_underlying_sfe` without inventing a parcel association. Only Matriklen objects with status Gældende count: the preliminary version (Foreløbig) that a pending cadastral case adds next to the current property is ignored, and two different current objects for one BFE throw `InvalidResponseException`.
 
-The local normalization/query-contract test does not make network requests:
+The local normalization/query-contract suite does not make network requests:
 
 ```bash
-php tests/soil_contamination_test.php
+php tests/soil-contamination/run.php
 ```
 
 ## CVR lookups
@@ -385,12 +386,12 @@ The normalized CVR records intentionally remain limited to fields exposed by the
 Datafordeler GraphQL contract. Source-specific payloads are not part of them and must not
 leak into application persistence contracts.
 
-The local test checks the requests, batching, pagination, normalization and the choice of
+The local suite checks the requests, batching, pagination, normalization and the choice of
 the latest employee figure against scripted responses, and every query document against
 the bundled flexibleCurrent v3 schema, without network requests:
 
 ```bash
-php tests/cvr_lookup_test.php
+php tests/cvr/run.php
 ```
 
 The current default uses Datafordeler `flexibleCurrent/v3`. Host applications can
@@ -564,12 +565,12 @@ Transfer:
   `movablesPrice` the løsøresum, in `currency`; `disposalDate` is the afståelsesdato.
   `trade` is `null` when EJF has no trade information for the transfer.
 
-The local test checks the Shared Secret flow, the requests, batching, pagination and
+The local suite checks the Shared Secret flow, the requests, batching, pagination and
 normalization against scripted responses, and every query document against the bundled
 flexibleCurrent v3 schema, without network requests:
 
 ```bash
-php tests/ejf_lookup_test.php
+php tests/ejf/run.php
 ```
 
 Host applications can override the endpoint selection like the CVR one, under
@@ -590,11 +591,11 @@ is deliberately isolated because the public SKAT page is not a documented API co
 No CAPTCHA, login, or access control is bypassed. The exact queried CVR/SE number is retained
 because a legal CVR number may use separate administrative SE numbers for VAT registration.
 
-The parser smoke test covers the observed CVR/SE search controls plus decisive positive and
+The parser suite covers the observed CVR/SE search controls plus decisive positive and
 negative result wording without making a live network request:
 
 ```bash
-php tests/skat_vat_web_parser_test.php
+php tests/vat-registration/run.php
 ```
 
 ## Internal Datafordeler client
@@ -642,11 +643,21 @@ Internal transport helpers are not registered as host-app services.
 Package-owned defaults live under `danish_public_sector_data` in
 `src/Boot/Registry.php` and may be overridden by the host app through normal
 CitOmni configuration precedence. The services read these keys directly, so the
-baseline is the only source of their defaults. A local test checks every cfg read
+baseline is the only source of their defaults. A local suite checks every cfg read
 in `src/` against the baseline:
 
 ```bash
-php tests/cfg_reads_test.php
+php tests/cfg-reads/run.php
+```
+
+## Develop the package
+
+Install the dependencies in the package root and run every suite. The suites make no network
+requests. Each suite folder in `tests/` has a README with its checks and expected totals.
+
+```bash
+composer install
+composer test
 ```
 
 ## Data and licensing

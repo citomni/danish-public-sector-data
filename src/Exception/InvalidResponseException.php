@@ -16,7 +16,10 @@ declare(strict_types=1);
 namespace CitOmni\DanishPublicSectorData\Exception;
 
 /**
- * Thrown when a remote service response cannot be interpreted safely.
+ * InvalidResponseException: Exception for a remote answer that cannot be interpreted safely.
+ *
+ * Lets a caller tell an answer that the package will not guess about, such as a malformed document
+ * or an ambiguous value, from a request that failed.
  */
-final class InvalidResponseException extends PublicDataException {
+class InvalidResponseException extends PublicDataException {
 }

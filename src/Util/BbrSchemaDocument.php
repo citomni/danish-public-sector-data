@@ -16,26 +16,33 @@ declare(strict_types=1);
 namespace CitOmni\DanishPublicSectorData\Util;
 
 /**
- * Parse the BBR object-type surface from one bundled GraphQL SDL document.
+ * BbrSchemaDocument: Util that reads the BBR object types of a GraphQL schema document.
  *
- * Behavior:
- * - Extracts every object type whose name starts with "BBR_".
- * - Preserves field names and GraphQL type signatures.
- * - Ignores descriptions, directives and non-BBR schema types.
+ * Turns a schema into the type map that BbrSchemaComparator compares. It reads the SDL as
+ * Datafordeler generates it; what a difference between two maps means belongs to the caller.
  *
- * Notes:
- * - This parser targets Datafordeler's generated SDL formatting bundled with this package.
- * - It performs no IO and is safe to use from tests and maintenance operations.
- *
- * Typical usage:
- *   $types = BbrSchemaDocument::types($schemaSource);
- *
- * @param string $schemaSource GraphQL SDL source.
- * @return array<string,array<string,string>> Type name => field name => type signature.
- * @throws \UnexpectedValueException When no BBR object types can be parsed.
+ * Rules:
+ * - Pure: Every result depends only on the arguments.
  */
-final class BbrSchemaDocument {
+class BbrSchemaDocument {
 
+	/**
+	 * Return the fields of every BBR object type in a schema document.
+	 *
+	 * Behavior:
+	 * - Covers every object type whose name starts with BBR_, apart from the Connection and Edge
+	 *   types of pagination.
+	 * - Keeps the type of each field as written, such as Long or [String!]. Descriptions, arguments
+	 *   and directives are left out.
+	 * - Types and fields are sorted by name.
+	 *
+	 * Typical usage:
+	 *   $types = BbrSchemaDocument::types($schemaSource);
+	 *
+	 * @param  string  $schemaSource  GraphQL SDL as Datafordeler generates it.
+	 * @return array<string,array<string,string>>  Field types keyed by type name and field name.
+	 * @throws \UnexpectedValueException  When the source is empty, its descriptions cannot be removed, or it holds no BBR object type.
+	 */
 	public static function types(string $schemaSource): array {
 		if ($schemaSource === '') {
 			throw new \UnexpectedValueException('BBR schema source cannot be empty.');

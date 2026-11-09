@@ -22,32 +22,39 @@ use CitOmni\Infrastructure\Exception\CurlException;
 use CitOmni\Kernel\App;
 
 /**
- * SkatVatWebClient: Query the anonymous SKAT VAT-number lookup web flow.
+ * SkatVatWebClient: Support class that runs SKAT's anonymous web lookup of VAT numbers.
  *
- * Behavior:
- * - Starts a fresh anonymous web session and discovers the current search form.
- * - Submits one exact eight-digit CVR/SE number with the form's hidden flow state.
- * - Recognizes SKAT's explicit positive/negative result text conservatively.
+ * Lets the vatRegistration service check one CVR/SE number while SKAT offers no API for it. The
+ * public page is no documented contract, so the client finds the search form anew on every lookup
+ * instead of relying on its field names, and reads only explicit result texts. What a result means
+ * for a caller belongs to VatRegistration.
  *
- * Notes:
- * - This is a temporary web-integration fallback, not a documented SKAT API contract.
- * - No CAPTCHA, login, authorization control, or other access restriction is bypassed.
- * - Session cookies and jsessionid-bearing URLs remain internal to the request flow.
- * - The HTML parser intentionally discovers current form field names instead of hard-coding Spring Web Flow internals.
+ * Rules:
+ * - Never bypass a CAPTCHA, a login or another access control.
+ * - Keep the session, its cookies and its jsessionid URLs inside one lookup.
+ * - Report a registration state only when the page states it.
  *
  * @internal
  */
-final class SkatVatWebClient {
+class SkatVatWebClient {
 
+	/** App whose cfg and curl service the client uses. */
 	private App $app;
+
+	/** URL of SKAT's public VAT-number search page. */
 	private string $searchUrl;
+
+	/** Request timeout in seconds. */
 	private int|float $timeout;
+
+	/** Connect timeout in seconds. */
 	private int|float $connectTimeout;
 
 	/**
-	 * Create the internal SKAT VAT web client.
+	 * Read and check the SKAT web cfg.
 	 *
-	 * @param App $app Application container.
+	 * @param  App  $app
+	 * @throws \UnexpectedValueException  When cfg danish_public_sector_data.skat_vat_web has a search_url that is not an HTTPS URL, or a timeout that is not a finite number of at least 0.
 	 */
 	public function __construct(App $app) {
 		$this->app = $app;
@@ -59,13 +66,26 @@ final class SkatVatWebClient {
 	}
 
 	/**
-	 * Query SKAT's public VAT-number lookup for one exact CVR/SE number.
+	 * Look up one CVR/SE number in SKAT's public VAT-number search.
 	 *
-	 * @param string $registrationNumber Validated eight-digit CVR/SE number.
-	 * @return array{registrationNumber:string,registered:?bool,verifiedOn:?string} Parsed current status.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\RateLimitException When SKAT rate-limits the request.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\RemoteServiceException When transport or HTTP execution fails.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the search flow cannot be interpreted safely.
+	 * Runs the search in an anonymous session of its own: It opens the search page, submits the
+	 * number in the search form and reads the result page.
+	 *
+	 * Behavior:
+	 * - registered is true or false only when the result page says so explicitly, and null when the
+	 *   page is not decisive.
+	 * - verifiedOn is the verification date that the page shows, as YYYY-MM-DD, or null.
+	 * - The cookie file of the session is removed again, also when the lookup fails.
+	 *
+	 * Typical usage:
+	 *   $result = (new SkatVatWebClient($this->app))->lookup('12345678');
+	 *
+	 * @param  string  $registrationNumber  CVR/SE number of eight digits, already validated.
+	 * @return array{registrationNumber:string,registered:?bool,verifiedOn:?string}
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\RateLimitException  When SKAT rate-limits a request.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\RemoteServiceException  When the cookie file cannot be created, a request fails or SKAT answers with an unsuccessful status.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the search form cannot be found or used safely.
+	 * @throws \UnexpectedValueException  When the search page has a form without an action and a URL that is not HTTPS.
 	 */
 	public function lookup(string $registrationNumber): array {
 		$cookieStore = \tempnam(\sys_get_temp_dir(), 'citomni-skat-vat-');
@@ -127,10 +147,12 @@ final class SkatVatWebClient {
 	}
 
 	/**
-	 * Execute one SKAT request and translate transport/HTTP failures.
+	 * Send one request of the lookup with the cfg timeouts.
 	 *
-	 * @param array<string,mixed> $request CitOmni Curl request.
-	 * @return array<string,mixed> CitOmni Curl response.
+	 * @param  array<string,mixed>  $request  Request of the curl service.
+	 * @return array<string,mixed>  Response of the curl service, with a successful status.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\RateLimitException  When SKAT answers 429.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\RemoteServiceException  When the request fails or SKAT answers with another unsuccessful status.
 	 */
 	private function request(array $request): array {
 		$request += [
@@ -157,12 +179,21 @@ final class SkatVatWebClient {
 	}
 
 	/**
-	 * Discover the CVR/SE search form and build the exact submission fields.
+	 * Find the CVR/SE search form and build its submission for one number.
 	 *
-	 * @param string $html Initial SKAT search page.
-	 * @param string $effectiveUrl Redirect-resolved search URL containing the active flow state.
-	 * @param string $registrationNumber Exact eight-digit CVR/SE number.
-	 * @return array{action:string,method:string,fields:array<string,string>} Parsed form submission.
+	 * Behavior:
+	 * - Uses the first form whose visible text contains cvr-/se-nummer, in any letter case.
+	 * - Keeps the hidden fields, chooses the search by number among the radio buttons, puts the number
+	 *   in the field that looks most like a CVR/SE field, and adds the search button when it has a
+	 *   name.
+	 * - The action is an absolute HTTPS URL without a jsessionid.
+	 *
+	 * @param  string  $html  Search page.
+	 * @param  string  $effectiveUrl  URL of the search page after redirects, without a jsessionid.
+	 * @param  string  $registrationNumber  CVR/SE number of eight digits.
+	 * @return array{action:string,method:string,fields:array<string,string>}  method is GET or POST.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When no such form exists, it uses another method, its number field cannot be found with confidence, or its action is not HTTPS.
+	 * @throws \UnexpectedValueException  When the form has no action and the page URL is not HTTPS.
 	 */
 	private function parseSearchForm(string $html, string $effectiveUrl, string $registrationNumber): array {
 		if (!\preg_match_all('~<form\b([^>]*)>(.*?)</form\s*>~isu', $html, $forms, \PREG_SET_ORDER)) {
@@ -291,11 +322,11 @@ final class SkatVatWebClient {
 	}
 
 	/**
-	 * Add the search submit control to a form submission when it has a name.
+	 * Add the search button of a form to its submission when the button has a name.
 	 *
-	 * @param string $formBody Search form HTML.
-	 * @param array<string,string> $fields Mutable form field map.
-	 * @return string|null Submit field name when one is required.
+	 * @param  string  $formBody  HTML inside the form.
+	 * @param  array<string,string>  $fields  Submission fields; gets the button's name and value.
+	 * @return string|null  Name of the button, or null when the form has no search button or the button has no name.
 	 */
 	private function appendSearchSubmit(string $formBody, array &$fields): ?string {
 		if (\preg_match_all('~<button\b([^>]*)>(.*?)</button\s*>~isu', $formBody, $buttons, \PREG_SET_ORDER)) {
@@ -335,10 +366,10 @@ final class SkatVatWebClient {
 
 
 	/**
-	 * Extract labels keyed by their target id.
+	 * Return the label texts of a form by the id they belong to.
 	 *
-	 * @param string $html Form HTML.
-	 * @return array<string,string> Visible label text by target id.
+	 * @param  string  $html  HTML inside the form.
+	 * @return array<string,string>  Visible label text keyed by the for attribute.
 	 */
 	private function labels(string $html): array {
 		$labels = [];
@@ -358,10 +389,10 @@ final class SkatVatWebClient {
 	}
 
 	/**
-	 * Extract input attributes from one form body.
+	 * Return the attributes of every input element of a form.
 	 *
-	 * @param string $html Form HTML.
-	 * @return list<array<string,string>> Input attribute maps.
+	 * @param  string  $html  HTML inside the form.
+	 * @return list<array<string,string>>  Attribute maps, as attributes() returns them.
 	 */
 	private function inputs(string $html): array {
 		if (!\preg_match_all('~<input\b([^>]*)>~isu', $html, $matches, \PREG_SET_ORDER)) {
@@ -377,10 +408,10 @@ final class SkatVatWebClient {
 	}
 
 	/**
-	 * Parse a compact HTML attribute fragment without requiring ext-dom.
+	 * Parse the attributes of one HTML tag.
 	 *
-	 * @param string $source Text between the tag name and closing bracket.
-	 * @return array<string,string> Lowercase attribute names with decoded values.
+	 * @param  string  $source  Text between the tag name and the closing bracket.
+	 * @return array<string,string>  Decoded values keyed by lowercase attribute name; an attribute without a value has its name as value.
 	 */
 	private static function attributes(string $source): array {
 		$attributes = [];
@@ -399,11 +430,13 @@ final class SkatVatWebClient {
 	}
 
 	/**
-	 * Resolve a form action against the redirect-resolved search URL.
+	 * Resolve a form action against the URL of the search page.
 	 *
-	 * @param string $baseUrl Effective search URL.
-	 * @param string $action Raw form action, possibly relative.
-	 * @return string Absolute HTTPS action URL.
+	 * @param  string  $baseUrl  URL of the search page after redirects.
+	 * @param  string  $action  Action attribute of the form, possibly relative or empty.
+	 * @return string  Absolute HTTPS URL without a jsessionid.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the action uses plain HTTP, or the page URL is not an HTTPS URL with a host.
+	 * @throws \UnexpectedValueException  When the action is empty and the page URL is not HTTPS.
 	 */
 	private function resolveUrl(string $baseUrl, string $action): string {
 		$action = \html_entity_decode(\trim($action), \ENT_QUOTES | \ENT_HTML5, 'UTF-8');
@@ -440,20 +473,20 @@ final class SkatVatWebClient {
 	}
 
 	/**
-	 * Remove URL-rewritten anonymous session IDs once the cookie jar owns the session.
+	 * Remove a jsessionid path parameter from a URL, since the cookie file holds the session.
 	 *
-	 * @param string $url HTTPS URL.
-	 * @return string URL without a `;jsessionid=...` path parameter.
+	 * @param  string  $url
+	 * @return string  The URL without ;jsessionid=...
 	 */
 	private static function withoutJsessionId(string $url): string {
 		return (string)\preg_replace('~;jsessionid=[^?/#;]*~i', '', $url);
 	}
 
 	/**
-	 * Convert HTML to compact visible text suitable for deterministic matching.
+	 * Turn HTML into its visible text, with whitespace collapsed.
 	 *
-	 * @param string $html HTML response.
-	 * @return string Normalized visible text.
+	 * @param  string  $html
+	 * @return string  Text without scripts, styles and tags; entities decoded and no-break spaces made plain.
 	 */
 	private function visibleText(string $html): string {
 		$html = (string)\preg_replace('~<(script|style|noscript)\b[^>]*>.*?</\1\s*>~isu', ' ', $html);
@@ -465,11 +498,17 @@ final class SkatVatWebClient {
 	}
 
 	/**
-	 * Interpret only explicit SKAT result phrases; ambiguity remains null.
+	 * Read the registration state from the text of a result page.
 	 *
-	 * @param string $text Normalized result-page text.
-	 * @param string $registrationNumber Queried number.
-	 * @return bool|null Registration state or null when the page is not decisive.
+	 * Behavior:
+	 * - false when the page says that no VAT-registered company matches or that no data exists, or
+	 *   shows one of SKAT's error codes for that.
+	 * - true when the page shows the number and says that the company is VAT-registered.
+	 * - null otherwise.
+	 *
+	 * @param  string  $text  Visible text of the result page.
+	 * @param  string  $registrationNumber  The number that was searched for.
+	 * @return bool|null
 	 */
 	private function registrationState(string $text, string $registrationNumber): ?bool {
 		if (
@@ -498,10 +537,10 @@ final class SkatVatWebClient {
 	}
 
 	/**
-	 * Read and normalize SKAT's displayed verification date when present.
+	 * Read the verification date that a result page shows.
 	 *
-	 * @param string $text Normalized result-page text.
-	 * @return string|null ISO date or null when no date is displayed.
+	 * @param  string  $text  Visible text of the result page.
+	 * @return string|null  The date as YYYY-MM-DD, or null when the page shows no valid date.
 	 */
 	private function verificationDate(string $text): ?string {
 		if (!\preg_match('/Verifikationsdato\s*:\s*([0-9]{2})-([0-9]{2})-([0-9]{4})/iu', $text, $match)) {
@@ -518,11 +557,11 @@ final class SkatVatWebClient {
 	}
 
 	/**
-	 * Compare user-facing Danish text case-insensitively without requiring mbstring.
+	 * Tell whether a text contains another, ignoring the case of ASCII letters.
 	 *
-	 * @param string $haystack Text to search.
-	 * @param string $needle Text to find.
-	 * @return bool True when present.
+	 * @param  string  $haystack
+	 * @param  string  $needle
+	 * @return bool
 	 */
 	private static function containsFolded(string $haystack, string $needle): bool {
 		return \stripos($haystack, $needle) !== false;
@@ -530,11 +569,12 @@ final class SkatVatWebClient {
 
 
 	/**
-	 * Require one configured HTTPS URL.
+	 * Require an HTTPS URL.
 	 *
-	 * @param string $url Raw configured URL.
-	 * @param string $key Configuration key for diagnostics.
-	 * @return string Validated HTTPS URL.
+	 * @param  string  $url  URL to check; surrounding whitespace is ignored.
+	 * @param  string  $key  Name of the URL, for the exception message.
+	 * @return string  The trimmed URL.
+	 * @throws \UnexpectedValueException  When the URL is empty or not HTTPS.
 	 */
 	private function httpsUrl(string $url, string $key): string {
 		$url = \trim($url);
@@ -546,11 +586,12 @@ final class SkatVatWebClient {
 	}
 
 	/**
-	 * Normalize a timeout without silently accepting invalid configuration.
+	 * Check one timeout from cfg.
 	 *
-	 * @param mixed $value Raw configured timeout.
-	 * @param string $key Configuration key for diagnostics.
-	 * @return int|float Timeout in seconds.
+	 * @param  mixed  $value  Timeout from cfg.
+	 * @param  string  $key  Cfg key, for the exception message.
+	 * @return int|float  Timeout in seconds.
+	 * @throws \UnexpectedValueException  When the value is not a finite number of at least 0.
 	 */
 	private function normalizeTimeout(mixed $value, string $key): int|float {
 		if (!\is_int($value) && !\is_float($value)) {

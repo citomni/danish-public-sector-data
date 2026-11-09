@@ -16,7 +16,9 @@ declare(strict_types=1);
 namespace CitOmni\DanishPublicSectorData\Exception;
 
 /**
- * Thrown when a remote public data service rejects a request because of rate limiting.
+ * RateLimitException: Exception for a request that a remote service refused because of rate limiting.
+ *
+ * Lets a caller tell a refusal that waiting may lift from other failures of a remote service.
  */
-final class RateLimitException extends RemoteServiceException {
+class RateLimitException extends RemoteServiceException {
 }

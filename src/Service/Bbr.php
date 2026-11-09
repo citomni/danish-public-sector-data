@@ -22,44 +22,61 @@ use CitOmni\DanishPublicSectorData\Util\BbrFieldCatalog;
 use CitOmni\Kernel\Service\BaseService;
 
 /**
- * Bbr: Resolve Danish property addresses and read normalized BBR property data.
+ * Bbr: Service that resolves Danish property addresses and reads current BBR property data.
  *
- * Behavior:
- * - Resolves auction-style addresses through DAR and BBR without relying on DAWA.
- * - Preserves trailing "m.fl." as an explicit incomplete-scope signal.
- * - Resolves SFE, building-on-foreign-ground, and owner-apartment BFE properties.
- * - Returns a normalized current property graph keyed by the authoritative BFE number.
- * - Exposes technical-installation history separately so normal lookups avoid history overhead.
- * - Uses batched identifier queries and cursor pagination where Datafordeleren supports them.
+ * Gives host apps the BFE number behind a typed address and the property behind a BFE number, as
+ * package-owned arrays built from BBR and DAR through Datafordeler, without DAWA. It covers samlet
+ * fast ejendom (SFE), buildings on foreign ground (BPFG) and owner apartments. Authentication and
+ * transport belong to DatafordelerClient, the labels of BBR codes to BbrCodeLists, and the BBR
+ * fields without a key of their own to BbrFieldCatalog.
  *
- * Notes:
- * - Address resolution never silently chooses between ambiguous BFE candidates.
- * - A selected owner-apartment unit takes precedence over the underlying SFE candidate.
- * - Public result shapes use package-owned keys rather than upstream GraphQL field names.
- * - BBR code values remain authoritative while bundled snapshot labels are returned additively.
+ * Rules:
+ * - Never choose between BFE candidates when the evidence is not decisive: Report the ambiguity.
+ * - Select every BBR v3 field of an entity apart from Datafordeler's internal ones, and return
+ *   each domain field under a key of its own or through BbrFieldCatalog, so no value is lost.
+ * - Return BBR codes as they are; a label only adds to its code.
+ * - Give every physical object the scope it has for the requested property, so an object that
+ *   belongs to another property, such as the building that holds an owner apartment, is not
+ *   presented as part of it.
  *
- * Typical usage:
- *   $resolution = $this->app->bbr->resolveAddress('Nørmarkvej 29, 2 22, 7600 Struer');
- *   $property = $this->app->bbr->getPropertyByBfe('337504');
- *
- * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When a remote lookup fails.
+ * @phpstan-type BbrGraph array{
+ *     grounds:array<string,array<string,mixed>>,
+ *     buildings:array<string,array<string,mixed>>,
+ *     units:array<string,array<string,mixed>>,
+ *     floors:array<string,array<string,mixed>>,
+ *     entrances:array<string,array<string,mixed>>,
+ *     technicalInstallations:array<string,array<string,mixed>>
+ * }
  */
-final class Bbr extends BaseService {
+class Bbr extends BaseService {
 
+	/** Largest page that Datafordeler serves. */
 	private const int PAGE_SIZE = 1000;
+
+	/** Maximum number of ids in one in filter. */
 	private const int IDENTIFIER_BATCH_SIZE = 100;
 
+	/** Datafordeler client that authenticates with the API key. */
 	private DatafordelerClient $datafordeler;
+
+	/** Datafordeler service for current BBR and DAR data. */
 	private string $currentService;
+
+	/** Version of the current-data service. */
 	private string $currentVersion;
+
+	/** Datafordeler service for BBR history. */
 	private string $historyService;
+
+	/** Version of the history service. */
 	private string $historyVersion;
 
 	/**
-	 * Load BBR endpoint selection and initialize the internal Datafordeler client.
+	 * Read the BBR endpoints from cfg and create the Datafordeler client.
 	 *
 	 * @return void
-	 * @throws \UnexpectedValueException When BBR endpoint configuration is invalid.
+	 * @throws \UnexpectedValueException  When a service or version in cfg danish_public_sector_data.bbr is empty, or the Datafordeler cfg is invalid.
+	 * @see \CitOmni\Kernel\Service\BaseService::__construct()  Calls it once per instance.
 	 */
 	protected function init(): void {
 		$cfg = $this->app->cfg->danish_public_sector_data->bbr;
@@ -82,17 +99,36 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Resolve one human-entered Danish property address to BFE candidates.
+	 * Resolve one typed Danish property address to BFE candidates.
+	 *
+	 * Reads the postcode, the street, the house number and the DAR addresses of the house number, and
+	 * collects the properties that BBR relates to them. Meant for addresses as auction lists write
+	 * them, with an optional floor and door and an optional trailing m.fl.
 	 *
 	 * Behavior:
-	 * - Parses street, house number, optional floor/door, and postcode.
-	 * - Removes trailing "m.fl." only from the lookup value and preserves the scope hint.
-	 * - Prefers exact street matches inside the exact postcode.
-	 * - Uses deterministic fuzzy street matching only when no exact match exists.
-	 * - Resolves a concrete owner-apartment unit when floor/door identifies one exact DAR address.
-	 * - Returns ambiguity instead of selecting one BFE when evidence is not decisive.
+	 * - selectedBfeNumber is set only when the evidence is decisive: One candidate in total, or one
+	 *   owner apartment whose unit has the selected DAR address, which is the address of the typed
+	 *   floor and door, or the only address of the house number. Otherwise it is null.
+	 * - bfeCandidates lists every candidate, ordered by BFE number. evidence names how a candidate
+	 *   was found: ground_sfe, building_bpfg, building_ejerlejlighed, unit_ejerlejlighed or
+	 *   selected_unit_ejerlejlighed.
+	 * - status tells how far the resolution got: unparseable, postcode_not_unique,
+	 *   street_ambiguous_or_not_found, house_number_not_unique, ambiguous_unit, no_bfe,
+	 *   ambiguous_bfe, primary_resolved_scope_incomplete or resolved.
+	 * - A trailing m.fl. or mfl. is removed from lookupInput and sets multiplePropertiesHint. With a
+	 *   selected BFE number, status is then primary_resolved_scope_incomplete: The other properties
+	 *   of the auction are not resolved, and their BFE numbers are never guessed.
+	 * - The street matches exactly within the postcode. Without an exact match, a misspelt name
+	 *   resolves only when one street is clearly the closest, with status fuzzy_unique in
+	 *   streetMatch.
+	 * - warnings lists what limits the result: address_unparseable, postcode_not_unique,
+	 *   street_ambiguous_or_not_found, house_number_not_unique, multiple_properties_scope_incomplete,
+	 *   street_fuzzy_match, multiple_addresses_without_unit or multiple_bfe_candidates.
 	 *
-	 * @param string $address Human-entered address.
+	 * Typical usage:
+	 *   $resolution = $this->app->bbr->resolveAddress('Eksempelvej 29, 2 22, 7600 Struer');
+	 *
+	 * @param  string  $address  Typed address; surrounding whitespace is ignored.
 	 * @return array{
 	 *     input:string,
 	 *     lookupInput:string,
@@ -120,9 +156,9 @@ final class Bbr extends BaseService {
 	 *     }>,
 	 *     selectedBfeNumber:?int,
 	 *     warnings:list<string>
-	 * } Resolution result.
-	 * @throws \InvalidArgumentException When the address is empty.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When the remote lookup fails or is malformed.
+	 * }
+	 * @throws \InvalidArgumentException  When the address is empty.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a remote lookup fails or is malformed.
 	 */
 	public function resolveAddress(string $address): array {
 		$address = \trim($address);
@@ -270,14 +306,30 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Return one normalized current BBR property graph by BFE number.
+	 * Return the current BBR data of one property by BFE number.
 	 *
-	 * @param int|string $bfeNumber Positive BFE number.
+	 * Behavior:
+	 * - propertyType is sfe, bpfg or ejerlejlighed.
+	 * - The lists hold the objects of the property and the objects it sits in or on, such as the
+	 *   ground under a building on foreign ground or the building that holds an owner apartment.
+	 *   scope is property for an object of the property itself, and context for the others.
+	 * - Technical installations whose status is historic or registered in error (statusCode 10 or 11)
+	 *   are left out; getTechnicalInstallationHistory() has them.
+	 * - Buildings are ordered by building number, technical installations by installation number,
+	 *   each then by id.
+	 * - Every code comes with its label from BbrCodeLists, null for an unknown code.
+	 *   codeListSnapshotDate and codeListSources name the dates of the code lists.
+	 *
+	 * Typical usage:
+	 *   $property = $this->app->bbr->getPropertyByBfe('4268969');
+	 *
+	 * @param  int|string  $bfeNumber  BFE number: A positive integer without leading zeroes.
 	 * @return array{
 	 *     bfeNumber:int,
 	 *     propertyRelationId:string,
 	 *     propertyType:string,
 	 *     codeListSnapshotDate:string,
+	 *     codeListSources:array{primarySnapshotDate:string,verifiedSourceCheckDate:string,supplementCoverageDate:string},
 	 *     statusCode:?string,
 	 *     statusLabel:?string,
 	 *     ownerTypeCode:?string,
@@ -294,9 +346,9 @@ final class Bbr extends BaseService {
 	 *     floors:list<array<string,mixed>>,
 	 *     entrances:list<array<string,mixed>>,
 	 *     technicalInstallations:list<array<string,mixed>>
-	 * }|null Normalized current property graph, or null when the BFE number does not exist.
-	 * @throws \InvalidArgumentException When the BFE number is invalid.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When the remote lookup fails or is malformed.
+	 * }|null  Null when BBR has no current property with the number.
+	 * @throws \InvalidArgumentException  When the BFE number is not a positive integer without leading zeroes.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a remote lookup fails or is malformed, or BBR has several current properties with the number.
 	 */
 	public function getPropertyByBfe(int|string $bfeNumber): ?array {
 		$bfe = self::normalizeBfeNumber($bfeNumber);
@@ -386,17 +438,27 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Return technical-installation effect history for one BFE property.
+	 * Return every registered version of the technical installations of one property by BFE number.
+	 *
+	 * For due diligence, such as former oil tanks, which the current data no longer shows once they
+	 * are removed.
 	 *
 	 * Behavior:
-	 * - Resolves the current property graph first to identify relevant BBR object IDs.
-	 * - Queries BBR/v3 without virkningstid so all effect-time versions known now are returned.
-	 * - Deduplicates identical temporal versions without collapsing legitimate history rows.
+	 * - Covers the technical installations of the property's own grounds, buildings and units, and
+	 *   for a building on foreign ground or an owner apartment those registered on the property.
+	 * - Returns every version that BBR has registered now, also those whose effect has ended. A
+	 *   version that several lookups return is returned once.
+	 * - Ordered by installation number, then validFrom, registeredFrom and id.
+	 * - Empty when BBR has no current property with the number.
 	 *
-	 * @param int|string $bfeNumber Positive BFE number.
-	 * @return list<array<string,mixed>> Normalized technical-installation history.
-	 * @throws \InvalidArgumentException When the BFE number is invalid.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When the remote lookup fails or is malformed.
+	 * Typical usage:
+	 *   $history = $this->app->bbr->getTechnicalInstallationHistory('4268969');
+	 *
+	 * @param  int|string  $bfeNumber  BFE number: A positive integer without leading zeroes.
+	 * @return list<array<string,mixed>>  Technical installations with scope property.
+	 * @throws \InvalidArgumentException  When the BFE number is not a positive integer without leading zeroes.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a remote lookup fails or is malformed, or BBR has several current properties with the number.
+	 * @see \CitOmni\DanishPublicSectorData\Service\Bbr::normalizeTechnicalInstallation()  The keys of a technical installation.
 	 */
 	public function getTechnicalInstallationHistory(int|string $bfeNumber): array {
 		$bfe = self::normalizeBfeNumber($bfeNumber);
@@ -517,9 +579,19 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Load one SFE property graph.
+	 * Load the objects of a samlet fast ejendom (SFE).
 	 *
-	 * @return array<string,array<string,array<string,mixed>>>
+	 * Behavior:
+	 * - Holds the grounds of the property, their buildings, the units of those buildings, and the
+	 *   floors, entrances and technical installations of the property's own buildings and units.
+	 * - A building that belongs to a building on foreign ground or to an owner apartment, a unit of
+	 *   an owner apartment, and a technical installation registered on either have scope context;
+	 *   the other objects have scope property.
+	 *
+	 * @param  string  $propertyId  BBR property relation id of the SFE.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return BbrGraph  Normalized objects keyed by id.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed.
 	 */
 	private function loadSfeGraph(string $propertyId, string $effectiveAt): array {
 		$grounds = self::keyById(
@@ -668,9 +740,19 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Load one building-on-foreign-ground property graph.
+	 * Load the objects of a building on foreign ground (BPFG).
 	 *
-	 * @return array<string,array<string,array<string,mixed>>>
+	 * Behavior:
+	 * - Holds the buildings of the property, their units, floors and entrances, the grounds they
+	 *   stand on, and the technical installations of the property, of its buildings and of its own
+	 *   units.
+	 * - The grounds and the units of owner apartments have scope context; the other objects have
+	 *   scope property.
+	 *
+	 * @param  string  $propertyId  BBR property relation id of the BPFG.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return BbrGraph  Normalized objects keyed by id.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed.
 	 */
 	private function loadBpfgGraph(string $propertyId, string $effectiveAt): array {
 		$relations = $this->fetchAll(
@@ -793,9 +875,19 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Load one owner-apartment property graph.
+	 * Load the objects of an owner apartment.
 	 *
-	 * @return array<string,array<string,array<string,mixed>>>
+	 * Behavior:
+	 * - Holds the units of the property, the buildings, floors and entrances of those units, the
+	 *   buildings registered on the property, the grounds of all these buildings, and the technical
+	 *   installations of the property and of its units.
+	 * - The units, the buildings registered on the property and the technical installations have
+	 *   scope property; the other objects have scope context.
+	 *
+	 * @param  string  $propertyId  BBR property relation id of the owner apartment.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return BbrGraph  Normalized objects keyed by id.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed.
 	 */
 	private function loadOwnerApartmentGraph(string $propertyId, string $effectiveAt): array {
 		$relations = $this->fetchAll(
@@ -913,17 +1005,26 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Resolve BFE candidates behind one DAR house number and optional selected address.
+	 * Collect the properties that BBR relates to one DAR house number, and select one when the evidence is decisive.
 	 *
+	 * Behavior:
+	 * - The candidates are the SFE of the grounds under the buildings of the house number, the
+	 *   BPFG and owner apartments of those buildings, and the owner apartments of their units, or
+	 *   of the units at the selected address when there is one.
+	 * - evidence names how a candidate was found: ground_sfe, building_bpfg,
+	 *   building_ejerlejlighed, unit_ejerlejlighed or selected_unit_ejerlejlighed.
+	 * - selectedBfeNumber is the one candidate with selected_unit_ejerlejlighed, or else the only
+	 *   candidate; null otherwise.
+	 * - Candidates are ordered by BFE number.
+	 *
+	 * @param  string  $houseNumberId  DAR id of the house number.
+	 * @param  array<string,mixed>|null  $selectedAddress  DAR address node that the typed address selects, or null.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
 	 * @return array{
-	 *     candidates:list<array{
-	 *         bfeNumber:int,
-	 *         propertyType:string,
-	 *         propertyRelationId:string,
-	 *         evidence:list<string>
-	 *     }>,
+	 *     candidates:list<array{bfeNumber:int,propertyType:string,propertyRelationId:string,evidence:list<string>}>,
 	 *     selectedBfeNumber:?int
 	 * }
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed, or a candidate has no valid BFE number or an unknown property type.
 	 */
 	private function resolveBfeCandidates(
 		string $houseNumberId,
@@ -1081,8 +1182,16 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Resolve a street inside one exact postcode.
+	 * Find the DAR street of a typed street name within one postcode.
 	 *
+	 * Behavior:
+	 * - A street of the postcode with exactly the typed name wins with status exact, when it is
+	 *   the only one.
+	 * - Otherwise every street of the postcode is a candidate for chooseStreet().
+	 *
+	 * @param  string  $input  Typed street name.
+	 * @param  string  $postcodeId  DAR id of the postcode.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
 	 * @return array{
 	 *     status:string,
 	 *     input:string,
@@ -1090,6 +1199,8 @@ final class Bbr extends BaseService {
 	 *     selected:array<string,mixed>|null,
 	 *     candidates:list<array{name:string,distance:int,similarity:float}>
 	 * }
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed.
+	 * @see \CitOmni\DanishPublicSectorData\Service\Bbr::chooseStreet()  How a candidate is chosen.
 	 */
 	private function resolveStreet(string $input, string $postcodeId, string $effectiveAt): array {
 		$exact = $this->fetchAll(
@@ -1152,11 +1263,26 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Choose a deterministic street candidate.
+	 * Choose the street that a typed name means among candidate streets.
 	 *
-	 * @param string $input User street name.
-	 * @param list<array<string,mixed>> $streets Candidate DAR streets.
-	 * @return array<string,mixed> Street match result.
+	 * Behavior:
+	 * - Names are compared by edit distance, without letter case, spaces and punctuation, and with
+	 *   Danish letters spelt out.
+	 * - status is exact for a name at distance 0, and fuzzy_unique when the closest name has a
+	 *   similarity of at least 0.85 and leads the next by at least 0.08; selected is then that
+	 *   street. Otherwise status is ambiguous, or not_found without candidates, and selected null.
+	 * - candidates lists the five closest names, closest first.
+	 *
+	 * @param  string  $input  Typed street name.
+	 * @param  list<array<string,mixed>>  $streets  DAR street nodes.
+	 * @return array{
+	 *     status:string,
+	 *     input:string,
+	 *     matched:?string,
+	 *     selected:array<string,mixed>|null,
+	 *     candidates:list<array{name:string,distance:int,similarity:float}>
+	 * }
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When a street name is neither a string nor an int.
 	 */
 	private function chooseStreet(string $input, array $streets): array {
 		$inputNormalized = self::normalizeForDistance($input);
@@ -1230,8 +1356,17 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Parse auction-style address input.
+	 * Split a typed address into street, house number, floor and door, postcode and city.
 	 *
+	 * Behavior:
+	 * - A trailing m.fl. or mfl., in any letter case, is removed from lookupInput and sets
+	 *   multiplePropertiesHint.
+	 * - postcode is the first four-digit word that a city name follows; houseNumber is the number
+	 *   after the street name, with an optional letter in upper case; text after a comma behind it is
+	 *   the floor and door.
+	 * - A part that cannot be read is null.
+	 *
+	 * @param  string  $rawInput  Typed address.
 	 * @return array{
 	 *     lookupInput:string,
 	 *     multiplePropertiesHint:bool,
@@ -1287,9 +1422,14 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Parse one floor/door fragment.
+	 * Split a typed floor and door, such as 2 22 or st. tv.
 	 *
-	 * @return array{raw:string,floor:?string,door:?string}
+	 * Behavior:
+	 * - The first word is the floor and the rest the door, each normalized as normalizeUnitPart()
+	 *   does.
+	 *
+	 * @param  string  $value  Floor and door as typed.
+	 * @return array{raw:string,floor:?string,door:?string}  raw is the value as typed.
 	 */
 	private function parseUnit(string $value): array {
 		$normalized = self::normalizeSpaces(
@@ -1307,10 +1447,16 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Select one DAR address under a house number.
+	 * Select the DAR address of a typed floor and door among the addresses of one house number.
 	 *
-	 * @param list<array<string,mixed>> $addresses Address nodes.
-	 * @param array{raw:string,floor:?string,door:?string}|null $unit Parsed unit.
+	 * Behavior:
+	 * - With a floor and door: unit_exact and the address when exactly one address has them, as
+	 *   normalizeUnitPart() compares them; unit_not_unique and null otherwise.
+	 * - Without: single_address and the address when the house number has one address;
+	 *   multiple_addresses or no_address and null otherwise.
+	 *
+	 * @param  list<array<string,mixed>>  $addresses  DAR address nodes of the house number.
+	 * @param  array{raw:string,floor:?string,door:?string}|null  $unit  Typed floor and door, or null.
 	 * @return array{status:string,selected:array<string,mixed>|null}
 	 */
 	private function selectAddress(array $addresses, ?array $unit): array {
@@ -1346,7 +1492,18 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Determine final address-resolution status.
+	 * Return the final status of an address resolution.
+	 *
+	 * Behavior:
+	 * - resolved, or primary_resolved_scope_incomplete with the multiple-properties hint, when a BFE
+	 *   number is selected.
+	 * - Otherwise ambiguous_unit when the floor and door did not select one address, no_bfe without
+	 *   candidates, and ambiguous_bfe with several.
+	 *
+	 * @param  bool  $multiplePropertiesHint  Whether the typed address ended in m.fl.
+	 * @param  array{status:string,selected:array<string,mixed>|null}  $addressSelection  Result of selectAddress().
+	 * @param  array{candidates:list<array<string,mixed>>,selectedBfeNumber:?int}  $candidateData  Result of resolveBfeCandidates().
+	 * @return string
 	 */
 	private function resolutionStatus(
 		bool $multiplePropertiesHint,
@@ -1369,7 +1526,18 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Build one public resolution result.
+	 * Build the result of resolveAddress().
+	 *
+	 * @param  string  $input  Typed address, trimmed.
+	 * @param  array<string,mixed>  $parsed  Result of parseAuctionAddress().
+	 * @param  string  $status  Final status.
+	 * @param  array<string,mixed>|null  $streetMatch  Street match; its selected node is left out of the result.
+	 * @param  string|null  $matchedAddress  Text of the selected DAR address.
+	 * @param  list<array{bfeNumber:int,propertyType:string,propertyRelationId:string,evidence:list<string>}>  $candidates  BFE candidates.
+	 * @param  int|null  $selectedBfeNumber  Selected BFE number.
+	 * @param  list<string>  $warnings  Warnings.
+	 * @return array<string,mixed>
+	 * @see \CitOmni\DanishPublicSectorData\Service\Bbr::resolveAddress()  The shape of the result.
 	 */
 	private function resolutionResult(
 		string $input,
@@ -1406,10 +1574,14 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Fetch all pages from one Datafordeler connection.
+	 * Return the nodes of every page of one Datafordeler connection.
 	 *
-	 * @param callable(?string):string $queryBuilder Cursor-aware query builder.
-	 * @return list<array<string,mixed>> Connection nodes.
+	 * @param  string  $service  Datafordeler service.
+	 * @param  string  $version  Version of that service.
+	 * @param  string  $root  Connection name.
+	 * @param  callable(?string):string  $queryBuilder  Builder of the query document for one page; its argument is the cursor of the previous page, null for the first.
+	 * @return list<array<string,mixed>>  Nodes in response order.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a request fails, or a page is malformed or announces a next page without a cursor.
 	 */
 	private function fetchAll(
 		string $service,
@@ -1465,10 +1637,15 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Fetch current nodes in batches of at most 100 identifiers.
+	 * Fetch the current nodes whose identifier field holds one of many ids, up to 100 ids per request.
 	 *
-	 * @param callable(string,list<string>,?string):string $builder Query builder.
-	 * @return array<string,array<string,mixed>> Nodes keyed by id_lokalId.
+	 * @param  string  $root  Connection name.
+	 * @param  string  $field  Identifier field that the builder filters on.
+	 * @param  list<string>  $ids  Ids to look for.
+	 * @param  string  $effectiveAt  Unused: The builder carries the effect time.
+	 * @param  callable(string,list<string>,?string):string  $builder  Builder of the query document for one page; its arguments are the field, at most 100 ids and the cursor of the previous page.
+	 * @return array<string,array<string,mixed>>  Raw nodes keyed by id_lokalId.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a request fails, or a page or a node id is malformed.
 	 */
 	private function fetchByIdentifierBatches(
 		string $root,
@@ -1493,9 +1670,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Load current buildings by UUID.
+	 * Fetch current buildings by id.
 	 *
-	 * @return array<string,array<string,mixed>>
+	 * @param  list<string>  $ids  BBR ids of the buildings.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return array<string,array<string,mixed>>  Raw BBR_Bygning nodes keyed by id.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed.
 	 */
 	private function fetchBuildingsByIds(array $ids, string $effectiveAt): array {
 		return $this->fetchByIdentifierBatches(
@@ -1513,9 +1693,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Load current grounds by UUID.
+	 * Fetch current grounds by id.
 	 *
-	 * @return array<string,array<string,mixed>>
+	 * @param  list<string>  $ids  BBR ids of the grounds.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return array<string,array<string,mixed>>  Raw BBR_Grund nodes keyed by id.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed.
 	 */
 	private function fetchGroundsByIds(array $ids, string $effectiveAt): array {
 		return $this->fetchByIdentifierBatches(
@@ -1532,9 +1715,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Load current units by UUID.
+	 * Fetch current units by id.
 	 *
-	 * @return array<string,array<string,mixed>>
+	 * @param  list<string>  $ids  BBR ids of the units.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return array<string,array<string,mixed>>  Raw BBR_Enhed nodes keyed by id.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed.
 	 */
 	private function fetchUnitsByIds(array $ids, string $effectiveAt): array {
 		return $this->fetchByIdentifierBatches(
@@ -1552,9 +1738,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Load current building-property relations by building UUID.
+	 * Fetch the current property relations of buildings.
 	 *
-	 * @return array<string,array<string,mixed>>
+	 * @param  list<string>  $ids  BBR ids of the buildings.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return array<string,array<string,mixed>>  Raw BBR_BygningEjendomsrelation nodes keyed by relation id.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed.
 	 */
 	private function fetchBuildingRelationsByIds(array $ids, string $effectiveAt): array {
 		return $this->fetchByIdentifierBatches(
@@ -1571,9 +1760,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Load current unit-property relations by unit UUID.
+	 * Fetch the current property relations of units.
 	 *
-	 * @return array<string,array<string,mixed>>
+	 * @param  list<string>  $ids  BBR ids of the units.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return array<string,array<string,mixed>>  Raw BBR_EnhedEjendomsrelation nodes keyed by relation id.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed.
 	 */
 	private function fetchUnitRelationsByIds(array $ids, string $effectiveAt): array {
 		return $this->fetchByIdentifierBatches(
@@ -1591,9 +1783,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Load current property relations by UUID.
+	 * Fetch current property relations by id.
 	 *
-	 * @return array<string,array<string,mixed>>
+	 * @param  list<string>  $ids  BBR property relation ids.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return array<string,array<string,mixed>>  Raw BBR_Ejendomsrelation nodes keyed by id.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed.
 	 */
 	private function fetchPropertiesByIds(array $ids, string $effectiveAt): array {
 		return $this->fetchByIdentifierBatches(
@@ -1610,9 +1805,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Load current floors for buildings.
+	 * Load the current floors of buildings, with scope property.
 	 *
-	 * @return array<string,array<string,mixed>>
+	 * @param  list<string>  $buildingIds  BBR ids of the buildings.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return array<string,array<string,mixed>>  Normalized floors keyed by id.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed.
 	 */
 	private function loadFloorsForBuildings(array $buildingIds, string $effectiveAt): array {
 		$raw = $this->fetchByIdentifierBatches(
@@ -1637,9 +1835,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Load current entrances for buildings.
+	 * Load the current entrances of buildings, with scope property.
 	 *
-	 * @return array<string,array<string,mixed>>
+	 * @param  list<string>  $buildingIds  BBR ids of the buildings.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return array<string,array<string,mixed>>  Normalized entrances keyed by id.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed.
 	 */
 	private function loadEntrancesForBuildings(array $buildingIds, string $effectiveAt): array {
 		$raw = $this->fetchByIdentifierBatches(
@@ -1664,9 +1865,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Load current floors by UUID.
+	 * Fetch current floors by id.
 	 *
-	 * @return array<string,array<string,mixed>>
+	 * @param  list<string>  $ids  BBR ids of the floors.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return array<string,array<string,mixed>>  Raw BBR_Etage nodes keyed by id.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed.
 	 */
 	private function fetchFloorsByIds(array $ids, string $effectiveAt): array {
 		return $this->fetchByIdentifierBatches(
@@ -1684,9 +1888,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Load current entrances by UUID.
+	 * Fetch current entrances by id.
 	 *
-	 * @return array<string,array<string,mixed>>
+	 * @param  list<string>  $ids  BBR ids of the entrances.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return array<string,array<string,mixed>>  Raw BBR_Opgang nodes keyed by id.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed.
 	 */
 	private function fetchEntrancesByIds(array $ids, string $effectiveAt): array {
 		return $this->fetchByIdentifierBatches(
@@ -1704,9 +1911,13 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Load current technical installations by one identifier field.
+	 * Fetch the current technical installations of grounds, buildings or units.
 	 *
-	 * @return array<string,array<string,mixed>>
+	 * @param  string  $field  grund, bygning or enhed.
+	 * @param  list<string>  $ids  BBR ids of the objects.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return array<string,array<string,mixed>>  Raw BBR_TekniskAnlaeg nodes keyed by id.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed.
 	 */
 	private function fetchTechnicalByIds(string $field, array $ids, string $effectiveAt): array {
 		return $this->fetchByIdentifierBatches(
@@ -1724,9 +1935,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Load normalized DAR house numbers referenced by the graph.
+	 * Load the DAR house numbers that the grounds, buildings, entrances and technical installations of a graph refer to.
 	 *
-	 * @return list<array<string,mixed>>
+	 * @param  BbrGraph  $graph  Normalized objects of a property.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return list<array{id:string,formatted:?string,houseNumber:?string,landParcelId:?string,buildingId:?string,technicalInstallationId:?string}>
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed.
 	 */
 	private function loadHouseNumbers(array $graph, string $effectiveAt): array {
 		$ids = [];
@@ -1772,9 +1986,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Load normalized DAR addresses referenced by BBR units.
+	 * Load the DAR addresses of units.
 	 *
-	 * @return list<array<string,mixed>>
+	 * @param  array<string,array<string,mixed>>  $units  Normalized units.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return list<array{id:string,formatted:?string,houseNumberId:?string,floor:?string,door:?string}>
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed.
 	 */
 	private function loadUnitAddresses(array $units, string $effectiveAt): array {
 		$ids = [];
@@ -1810,10 +2027,11 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Normalize common BBR provenance metadata.
+	 * Normalize the BBR provenance of one node.
 	 *
-	 * @param array<string,mixed> $node Raw GraphQL node.
-	 * @return array<string,string> Non-empty source metadata.
+	 * @param  array<string,mixed>  $node  Raw GraphQL node.
+	 * @return array<string,string>  The business event, area and process, each with its label, and the registration and effect actors; only those that hold a value.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When a value is neither null, a string nor an int.
 	 */
 	private static function normalizeSourceMetadata(array $node): array {
 		$metadata = [
@@ -1834,7 +2052,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Normalize one ground.
+	 * Normalize one BBR_Grund node.
+	 *
+	 * @param  array<string,mixed>  $node  Raw node.
+	 * @param  string  $scope  property or context.
+	 * @return array<string,mixed>
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the node has no valid id or a value is invalid.
 	 */
 	private function normalizeGround(array $node, string $scope): array {
 		return [
@@ -1867,7 +2090,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Normalize one building.
+	 * Normalize one BBR_Bygning node.
+	 *
+	 * @param  array<string,mixed>  $node  Raw node.
+	 * @param  string  $scope  property or context.
+	 * @return array<string,mixed>
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the node has no valid id or a value is invalid.
 	 */
 	private function normalizeBuilding(array $node, string $scope): array {
 		return [
@@ -1943,7 +2171,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Normalize one BBR unit.
+	 * Normalize one BBR_Enhed node.
+	 *
+	 * @param  array<string,mixed>  $node  Raw node.
+	 * @param  string  $scope  property or context.
+	 * @return array<string,mixed>
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the node has no valid id or a value is invalid.
 	 */
 	private function normalizeUnit(array $node, string $scope): array {
 		return [
@@ -1993,7 +2226,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Normalize one floor.
+	 * Normalize one BBR_Etage node.
+	 *
+	 * @param  array<string,mixed>  $node  Raw node.
+	 * @param  string  $scope  property or context.
+	 * @return array<string,mixed>
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the node has no valid id or a value is invalid.
 	 */
 	private function normalizeFloor(array $node, string $scope): array {
 		return [
@@ -2021,7 +2259,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Normalize one entrance.
+	 * Normalize one BBR_Opgang node.
+	 *
+	 * @param  array<string,mixed>  $node  Raw node.
+	 * @param  string  $scope  property or context.
+	 * @return array<string,mixed>
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the node has no valid id or a value is invalid.
 	 */
 	private function normalizeEntrance(array $node, string $scope): array {
 		return [
@@ -2047,7 +2290,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Normalize one technical installation.
+	 * Normalize one BBR_TekniskAnlaeg node.
+	 *
+	 * @param  array<string,mixed>  $node  Raw node.
+	 * @param  string  $scope  property or context.
+	 * @return array<string,mixed>  coordinate is crs and wkt, or null when the node has none.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the node has no valid id or a value is invalid.
 	 */
 	private function normalizeTechnicalInstallation(array $node, string $scope): array {
 		$coordinate = $node['tek109Koordinat'] ?? null;
@@ -2112,10 +2360,11 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Return entity IDs having one normalized property scope.
+	 * Return the ids of the objects with one scope.
 	 *
-	 * @param array<string,array<string,mixed>> $nodes Normalized entity map.
-	 * @return list<string> Matching entity IDs.
+	 * @param  array<string,array<string,mixed>>  $nodes  Normalized objects keyed by id.
+	 * @param  string  $scope  property or context.
+	 * @return list<string>
 	 */
 	private function scopeIds(array $nodes, string $scope): array {
 		$ids = [];
@@ -2131,6 +2380,16 @@ final class Bbr extends BaseService {
 
 	/**
 	 * Merge nodes into a map keyed by id_lokalId.
+	 *
+	 * Behavior:
+	 * - A key that is a UUID is taken as the id of its node; a listed node is keyed by its
+	 *   id_lokalId, and a listed value that is not a node is skipped.
+	 * - A node replaces one with the same id in the map.
+	 *
+	 * @param  array<string,array<string,mixed>>  $target  Map to merge into.
+	 * @param  array<array-key,mixed>  $nodes  Nodes keyed by id, or listed.
+	 * @return void
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When a listed node has no valid id.
 	 */
 	private function mergeById(array &$target, array $nodes): void {
 		foreach ($nodes as $key => $node) {
@@ -2149,7 +2408,16 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Merge technical history without collapsing temporal versions.
+	 * Merge versions of technical installations, keeping each version once.
+	 *
+	 * Behavior:
+	 * - Two nodes are the same version when id_lokalId, virkningFra, virkningTil and
+	 *   registreringFra are equal; the later one replaces the earlier.
+	 *
+	 * @param  array<string,array<string,mixed>>  $target  Versions keyed by version.
+	 * @param  list<array<string,mixed>>  $nodes  Raw BBR_TekniskAnlaeg nodes.
+	 * @return void
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When a node has no valid id.
 	 */
 	private function mergeHistory(array &$target, array $nodes): void {
 		foreach ($nodes as $node) {
@@ -2164,10 +2432,13 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Fetch street/postcode relation rows.
+	 * Fetch the street-postcode relations of one postcode.
 	 *
-	 * @param list<string>|null $streetIds Optional exact-street filter.
-	 * @return list<array<string,mixed>>
+	 * @param  string  $postcodeId  DAR id of the postcode.
+	 * @param  list<string>|null  $streetIds  Only these streets, or null for every street of the postcode.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return list<array<string,mixed>>  Raw DAR_NavngivenVejPostnummer nodes.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed.
 	 */
 	private function fetchStreetPostcodeRelations(
 		string $postcodeId,
@@ -2209,9 +2480,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Fetch DAR streets by UUID.
+	 * Fetch DAR streets by id.
 	 *
-	 * @return array<string,array<string,mixed>>
+	 * @param  list<string>  $ids  DAR ids of the streets.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return array<string,array<string,mixed>>  Raw DAR_NavngivenVej nodes keyed by id.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed.
 	 */
 	private function fetchStreetsByIds(array $ids, string $effectiveAt): array {
 		return $this->fetchByIdentifierBatches(
@@ -2228,10 +2502,11 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Return a map keyed by id_lokalId.
+	 * Return nodes keyed by their id_lokalId.
 	 *
-	 * @param list<array<string,mixed>> $nodes Nodes.
-	 * @return array<string,array<string,mixed>> Node map.
+	 * @param  list<array<string,mixed>>  $nodes
+	 * @return array<string,array<string,mixed>>  A later node replaces an earlier one with the same id.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When a node has no valid id.
 	 */
 	private static function keyById(array $nodes): array {
 		$result = [];
@@ -2245,19 +2520,22 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Remove duplicate nodes by id_lokalId.
+	 * Return one node per id_lokalId.
 	 *
-	 * @param list<array<string,mixed>> $nodes Nodes.
-	 * @return list<array<string,mixed>> Unique nodes.
+	 * @param  list<array<string,mixed>>  $nodes
+	 * @return list<array<string,mixed>>  The last node of each id, in the order the ids first occur.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When a node has no valid id.
 	 */
 	private static function uniqueById(array $nodes): array {
 		return \array_values(self::keyById($nodes));
 	}
 
 	/**
-	 * Add one UUID to a set when valid.
+	 * Add a value to a set when it is a UUID.
 	 *
-	 * @param array<string,bool> $set UUID set.
+	 * @param  array<string,bool>  $set  UUIDs as keys.
+	 * @param  mixed  $value
+	 * @return void
 	 */
 	private static function addUuid(array &$set, mixed $value): void {
 		if (\is_string($value) && self::isUuid($value)) {
@@ -2266,11 +2544,13 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Resolve an optional BBR code through the bundled code-list snapshot.
+	 * Return the bundled label of an optional BBR code.
 	 *
-	 * @param string $list Official BBR code-list name.
-	 * @param mixed $value Raw upstream code value.
-	 * @return string|null Snapshot label, or null when the value or mapping is unavailable.
+	 * @param  string  $list  Name of the BBR code list.
+	 * @param  mixed  $value  Raw upstream code.
+	 * @return string|null  Null for no code or an unknown one.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the value is neither null, a string nor an int.
+	 * @see \CitOmni\DanishPublicSectorData\Util\BbrCodeLists::label()  Where the label comes from.
 	 */
 	private static function codeLabel(string $list, mixed $value): ?string {
 		$code = self::nullableString($value);
@@ -2280,6 +2560,10 @@ final class Bbr extends BaseService {
 
 	/**
 	 * Normalize a BFE number.
+	 *
+	 * @param  int|string  $value  Surrounding whitespace of a string is ignored.
+	 * @return int  At least 1.
+	 * @throws \InvalidArgumentException  When the value is not a positive integer without leading zeroes, or exceeds the int range.
 	 */
 	private static function normalizeBfeNumber(int|string $value): int {
 		$string = \is_int($value) ? (string)$value : \trim($value);
@@ -2297,7 +2581,14 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Map one BBR property type code to a stable package key.
+	 * Map a BBR property type code to the package's property type.
+	 *
+	 * Behavior:
+	 * - 1 is sfe, 2 bpfg and 3 ejerlejlighed.
+	 *
+	 * @param  string  $typeCode  BBR ejendomstype.
+	 * @return string
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  For any other code.
 	 */
 	private static function propertyKind(string $typeCode): string {
 		return match ($typeCode) {
@@ -2309,7 +2600,11 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Normalize a scalar to a nullable string.
+	 * Normalize an upstream string or int to text, or null.
+	 *
+	 * @param  mixed  $value  Raw upstream value.
+	 * @return string|null  Null for null and for an empty string.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the value is neither null, a string nor an int.
 	 */
 	private static function nullableString(mixed $value): ?string {
 		if ($value === null) {
@@ -2324,7 +2619,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Require one non-empty string.
+	 * Normalize a required upstream string or int to non-empty text.
+	 *
+	 * @param  mixed  $value  Raw upstream value.
+	 * @param  string  $label  Name of the value in exception messages.
+	 * @return string
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the value is missing or empty, or neither a string nor an int.
 	 */
 	private static function requiredString(mixed $value, string $label): string {
 		$value = self::nullableString($value);
@@ -2336,7 +2636,11 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Normalize a scalar to a nullable integer.
+	 * Normalize an upstream integer, or null.
+	 *
+	 * @param  mixed  $value  Raw upstream value: An int, or a string of an integer.
+	 * @return int|null  Null for null.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the value is not an integer in the int range.
 	 */
 	private static function nullableInt(mixed $value): ?int {
 		if ($value === null) {
@@ -2356,7 +2660,12 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Require one UUID.
+	 * Normalize a required upstream UUID.
+	 *
+	 * @param  mixed  $value  Raw upstream value.
+	 * @param  string  $label  Name of the value in exception messages.
+	 * @return string
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the value is missing or not a UUID.
 	 */
 	private static function requiredUuid(mixed $value, string $label): string {
 		$value = self::nullableString($value);
@@ -2368,7 +2677,10 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Test UUID format.
+	 * Tell whether a string is a UUID in its hexadecimal 8-4-4-4-12 form, in any letter case.
+	 *
+	 * @param  string  $value
+	 * @return bool
 	 */
 	private static function isUuid(string $value): bool {
 		return (bool)\preg_match(
@@ -2378,21 +2690,32 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Return one UTC GraphQL point-in-time value.
+	 * Return the current time in UTC as a Datafordeler effect time.
+	 *
+	 * @return string  Such as 2026-01-31T12:00:00Z.
 	 */
 	private static function now(): string {
 		return \gmdate('Y-m-d\TH:i:s\Z');
 	}
 
 	/**
-	 * Normalize whitespace.
+	 * Collapse whitespace to single spaces and trim.
+	 *
+	 * @param  string  $value
+	 * @return string
 	 */
 	private static function normalizeSpaces(string $value): string {
 		return \trim((string)\preg_replace('/\s+/u', ' ', \trim($value)));
 	}
 
 	/**
-	 * Normalize one floor/door token.
+	 * Normalize a floor or a door for comparison.
+	 *
+	 * Behavior:
+	 * - Lower case, with Danish letters spelt out as ae, oe and aa, and without dots and whitespace.
+	 *
+	 * @param  string  $value  Floor or door as typed or as DAR writes it.
+	 * @return string|null  Null when nothing is left.
 	 */
 	private static function normalizeUnitPart(string $value): ?string {
 		$value = \trim($value);
@@ -2415,7 +2738,14 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Normalize text for deterministic edit-distance comparison.
+	 * Normalize a street name for edit-distance comparison.
+	 *
+	 * Behavior:
+	 * - Lower case, with Danish letters spelt out as ae, oe and aa, other letters transliterated to
+	 *   ASCII where iconv can, and everything but letters and digits removed.
+	 *
+	 * @param  string  $value  Street name.
+	 * @return string
 	 */
 	private static function normalizeForDistance(string $value): string {
 		$value = \strtr($value, [
@@ -2439,7 +2769,11 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Build a GraphQL JSON string literal.
+	 * Encode a string as a GraphQL string literal.
+	 *
+	 * @param  string  $value
+	 * @return string  A JSON string literal, which is also a GraphQL string literal.
+	 * @throws \InvalidArgumentException  When the string cannot be encoded as JSON, such as invalid UTF-8.
 	 */
 	private static function gqlString(string $value): string {
 		try {
@@ -2453,9 +2787,11 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Build a GraphQL string-list literal.
+	 * Encode a list of strings as a GraphQL list literal.
 	 *
-	 * @param list<string> $values Values.
+	 * @param  list<string>  $values
+	 * @return string
+	 * @throws \InvalidArgumentException  When a value cannot be encoded.
 	 */
 	private static function gqlStringList(array $values): string {
 		return '[' . \implode(
@@ -2465,7 +2801,11 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Build optional cursor argument.
+	 * Build the after argument of a page request.
+	 *
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  Argument line with its leading line break, or an empty string for the first page.
+	 * @throws \InvalidArgumentException  When the cursor cannot be encoded as a GraphQL string.
 	 */
 	private static function afterArgument(?string $after): string {
 		return $after !== null
@@ -2474,7 +2814,9 @@ final class Bbr extends BaseService {
 	}
 
 	/**
-	 * Common pageInfo selection.
+	 * Return the pageInfo selection of a connection.
+	 *
+	 * @return string
 	 */
 	private static function pageInfoSelection(): string {
 		return <<<'GRAPHQL'
@@ -2489,6 +2831,15 @@ GRAPHQL;
 	// GraphQL current-state query builders
 	// ----------------------------------------------------------------
 
+	/**
+	 * Build the query document for one page of the DAR postcodes with one number.
+	 *
+	 * @param  string  $postcode  Postcode as typed, such as 7600.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildPostcodeQuery(string $postcode, string $effectiveAt, ?string $after): string {
 		$afterArg = self::afterArgument($after);
 		$postcode = self::gqlString($postcode);
@@ -2512,6 +2863,15 @@ query BbrResolvePostcode {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the DAR streets with exactly one name.
+	 *
+	 * @param  string  $street  Street name as typed.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildExactStreetsQuery(string $street, string $effectiveAt, ?string $after): string {
 		$afterArg = self::afterArgument($after);
 		$street = self::gqlString($street);
@@ -2534,6 +2894,16 @@ query BbrResolveExactStreet {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the street-postcode relations of one postcode.
+	 *
+	 * @param  string  $postcodeId  DAR id of the postcode.
+	 * @param  list<string>|null  $streetIds  At most 100 DAR street ids to narrow to, or null for every street.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildStreetPostcodeRelationsQuery(
 		string $postcodeId,
 		?array $streetIds,
@@ -2566,6 +2936,15 @@ query BbrResolveStreetPostcode {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of DAR streets by id.
+	 *
+	 * @param  list<string>  $ids  At most 100 DAR street ids.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildStreetsByIdsQuery(array $ids, string $effectiveAt, ?string $after): string {
 		$afterArg = self::afterArgument($after);
 		$list = self::gqlStringList($ids);
@@ -2588,6 +2967,17 @@ query BbrResolveStreetsById {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the DAR house numbers with one text on one street in one postcode.
+	 *
+	 * @param  string  $streetId  DAR id of the street.
+	 * @param  string  $postcodeId  DAR id of the postcode.
+	 * @param  string  $houseNumber  House number text, such as 27A.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildHouseNumberQuery(
 		string $streetId,
 		string $postcodeId,
@@ -2628,6 +3018,15 @@ query BbrResolveHouseNumber {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the DAR addresses of one house number.
+	 *
+	 * @param  string  $houseNumberId  DAR id of the house number.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildAddressesByHouseNumberQuery(
 		string $houseNumberId,
 		string $effectiveAt,
@@ -2657,6 +3056,15 @@ query BbrResolveAddresses {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the BBR property relations with one BFE number.
+	 *
+	 * @param  int  $bfe  BFE number.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When the cursor cannot be encoded as a GraphQL string.
+	 */
 	private function buildPropertyByBfeQuery(int $bfe, string $effectiveAt, ?string $after): string {
 		$afterArg = self::afterArgument($after);
 
@@ -2690,6 +3098,15 @@ query BbrPropertyByBfe {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of BBR property relations by id.
+	 *
+	 * @param  list<string>  $ids  At most 100 BBR property relation ids.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildPropertiesByIdsQuery(array $ids, string $effectiveAt, ?string $after): string {
 		$afterArg = self::afterArgument($after);
 		$list = self::gqlStringList($ids);
@@ -2720,6 +3137,15 @@ query BbrPropertiesById {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the grounds of one property.
+	 *
+	 * @param  string  $propertyId  BBR property relation id.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildGroundsByPropertyQuery(
 		string $propertyId,
 		string $effectiveAt,
@@ -2744,6 +3170,15 @@ query BbrGroundsByProperty {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of grounds by id.
+	 *
+	 * @param  list<string>  $ids  At most 100 BBR ground ids.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildGroundsByIdsQuery(array $ids, string $effectiveAt, ?string $after): string {
 		$afterArg = self::afterArgument($after);
 		$list = self::gqlStringList($ids);
@@ -2764,6 +3199,17 @@ query BbrGroundsById {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of buildings by their id or the id of their ground.
+	 *
+	 * @param  string  $field  id_lokalId or grund.
+	 * @param  list<string>  $ids  At most 100 ids.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \LogicException  When the field is another one.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildBuildingsByIdsQuery(
 		string $field,
 		array $ids,
@@ -2790,6 +3236,15 @@ query BbrBuildingsByIds {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the buildings registered on one owner apartment.
+	 *
+	 * @param  string  $propertyId  BBR property relation id of the owner apartment.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildBuildingsByOwnerApartmentQuery(
 		string $propertyId,
 		string $effectiveAt,
@@ -2814,6 +3269,15 @@ query BbrBuildingsByOwnerApartment {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the buildings of one house number, with their ground and owner apartment only.
+	 *
+	 * @param  string  $houseNumberId  DAR id of the house number.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildBuildingsByHouseNumberQuery(
 		string $houseNumberId,
 		string $effectiveAt,
@@ -2840,6 +3304,15 @@ query BbrBuildingsByHouseNumber {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the property relations of buildings.
+	 *
+	 * @param  list<string>  $ids  At most 100 BBR building ids.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildBuildingRelationsByIdsQuery(
 		array $ids,
 		string $effectiveAt,
@@ -2866,6 +3339,15 @@ query BbrBuildingRelationsByBuilding {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the building relations of one building on foreign ground.
+	 *
+	 * @param  string  $propertyId  BBR property relation id of the building on foreign ground.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildBuildingRelationsByPropertyQuery(
 		string $propertyId,
 		string $effectiveAt,
@@ -2892,6 +3374,17 @@ query BbrBuildingRelationsByProperty {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of units by their id or the id of their building.
+	 *
+	 * @param  string  $field  id_lokalId or bygning.
+	 * @param  list<string>  $ids  At most 100 ids.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \LogicException  When the field is another one.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildUnitsByIdsQuery(
 		string $field,
 		array $ids,
@@ -2918,6 +3411,15 @@ query BbrUnitsByIds {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the units of one DAR address, with their placement only.
+	 *
+	 * @param  string  $addressId  DAR id of the address.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildUnitsByAddressQuery(
 		string $addressId,
 		string $effectiveAt,
@@ -2947,6 +3449,17 @@ query BbrUnitsByAddress {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the property relations of units.
+	 *
+	 * @param  string  $field  enhed, the only field the query filters on.
+	 * @param  list<string>  $ids  At most 100 BBR unit ids.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \LogicException  When the field is another one.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildUnitRelationsByIdsQuery(
 		string $field,
 		array $ids,
@@ -2975,6 +3488,15 @@ query BbrUnitRelationsByUnit {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the unit relations of one owner apartment.
+	 *
+	 * @param  string  $propertyId  BBR property relation id of the owner apartment.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildUnitRelationsByPropertyQuery(
 		string $propertyId,
 		string $effectiveAt,
@@ -3001,6 +3523,17 @@ query BbrUnitRelationsByProperty {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of floors by their id or the id of their building.
+	 *
+	 * @param  string  $field  id_lokalId or bygning.
+	 * @param  list<string>  $ids  At most 100 ids.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \LogicException  When the field is another one.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildFloorsByIdsQuery(
 		string $field,
 		array $ids,
@@ -3027,6 +3560,17 @@ query BbrFloorsByIds {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of entrances by their id or the id of their building.
+	 *
+	 * @param  string  $field  id_lokalId or bygning.
+	 * @param  list<string>  $ids  At most 100 ids.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \LogicException  When the field is another one.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildEntrancesByIdsQuery(
 		string $field,
 		array $ids,
@@ -3053,6 +3597,17 @@ query BbrEntrancesByIds {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the technical installations of grounds, buildings or units.
+	 *
+	 * @param  string  $field  grund, bygning or enhed.
+	 * @param  list<string>  $ids  At most 100 ids.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \LogicException  When the field is another one.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildTechnicalByIdsQuery(
 		string $field,
 		array $ids,
@@ -3079,6 +3634,17 @@ query BbrTechnicalByIds {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of the technical installations registered on one building on foreign ground or owner apartment.
+	 *
+	 * @param  string  $field  bygningPaaFremmedGrund or ejerlejlighed.
+	 * @param  string  $propertyId  BBR property relation id.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \LogicException  When the field is another one.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildTechnicalByPropertyQuery(
 		string $field,
 		string $propertyId,
@@ -3105,6 +3671,15 @@ query BbrTechnicalByProperty {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of DAR house numbers by id.
+	 *
+	 * @param  list<string>  $ids  At most 100 DAR house-number ids.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildHouseNumbersByIdsQuery(
 		array $ids,
 		string $effectiveAt,
@@ -3134,6 +3709,15 @@ query BbrHouseNumbersById {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of DAR addresses by id.
+	 *
+	 * @param  list<string>  $ids  At most 100 DAR address ids.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildAddressesByIdsQuery(
 		array $ids,
 		string $effectiveAt,
@@ -3166,6 +3750,17 @@ GRAPHQL;
 	// GraphQL history query builders
 	// ----------------------------------------------------------------
 
+	/**
+	 * Build the query document for one page of every registered version of the technical installations of grounds, buildings or units.
+	 *
+	 * @param  string  $field  grund, bygning or enhed.
+	 * @param  list<string>  $ids  At most 100 ids.
+	 * @param  string  $registeredAt  UTC registration time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \LogicException  When the field is another one.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildTechnicalHistoryByIdsQuery(
 		string $field,
 		array $ids,
@@ -3192,6 +3787,17 @@ query BbrTechnicalHistoryByIds {
 GRAPHQL;
 	}
 
+	/**
+	 * Build the query document for one page of every registered version of the technical installations registered on one building on foreign ground or owner apartment.
+	 *
+	 * @param  string  $field  bygningPaaFremmedGrund or ejerlejlighed.
+	 * @param  string  $propertyId  BBR property relation id.
+	 * @param  string  $registeredAt  UTC registration time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \LogicException  When the field is another one.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
 	private function buildTechnicalHistoryByPropertyQuery(
 		string $field,
 		string $propertyId,
@@ -3219,9 +3825,12 @@ GRAPHQL;
 	}
 
 	/**
-	 * Validate a dynamically inserted GraphQL identifier field.
+	 * Require an identifier field that a query builder supports, before it becomes part of a query document.
 	 *
-	 * @param list<string> $allowed Allowed field names.
+	 * @param  string  $field
+	 * @param  list<string>  $allowed  Fields the builder supports.
+	 * @return void
+	 * @throws \LogicException  When the field is not among them.
 	 */
 	private static function assertIdentifierField(string $field, array $allowed): void {
 		if (!\in_array($field, $allowed, true)) {
@@ -3233,10 +3842,20 @@ GRAPHQL;
 	// GraphQL field selections
 	// ----------------------------------------------------------------
 
+	/**
+	 * Return the pageInfo selection of a connection, for interpolation in a query document.
+	 *
+	 * @return string
+	 */
 	private function pageInfo(): string {
 		return self::pageInfoSelection();
 	}
 
+	/**
+	 * Return the field selection of every query of grounds.
+	 *
+	 * @return string  BBR_Grund field names, one per line.
+	 */
 	private function groundFields(): string {
 		return <<<'GRAPHQL'
 bestemtFastEjendom
@@ -3269,6 +3888,11 @@ virkningTil
 GRAPHQL;
 	}
 
+	/**
+	 * Return the field selection of every full query of buildings.
+	 *
+	 * @return string  BBR_Bygning field names, one per line.
+	 */
 	private function buildingFields(): string {
 		return <<<'GRAPHQL'
 byg007Bygningsnummer
@@ -3366,6 +3990,11 @@ virkningTil
 GRAPHQL;
 	}
 
+	/**
+	 * Return the field selection of every full query of units.
+	 *
+	 * @return string  BBR_Enhed field names, one per line.
+	 */
 	private function unitFields(): string {
 		return <<<'GRAPHQL'
 adresseIdentificerer
@@ -3433,6 +4062,11 @@ virkningTil
 GRAPHQL;
 	}
 
+	/**
+	 * Return the field selection of every query of floors.
+	 *
+	 * @return string  BBR_Etage field names, one per line.
+	 */
 	private function floorFields(): string {
 		return <<<'GRAPHQL'
 bygning
@@ -3460,6 +4094,11 @@ virkningTil
 GRAPHQL;
 	}
 
+	/**
+	 * Return the field selection of every query of entrances.
+	 *
+	 * @return string  BBR_Opgang field names, one per line.
+	 */
 	private function entranceFields(): string {
 		return <<<'GRAPHQL'
 adgangFraHusnummer
@@ -3482,6 +4121,11 @@ virkningTil
 GRAPHQL;
 	}
 
+	/**
+	 * Return the field selection of every query of technical installations.
+	 *
+	 * @return string  BBR_TekniskAnlaeg field names, one per line.
+	 */
 	private function technicalFields(): string {
 		return <<<'GRAPHQL'
 bygning

@@ -22,33 +22,37 @@ use CitOmni\Infrastructure\Exception\CurlException;
 use CitOmni\Kernel\App;
 
 /**
- * DkJordWfsClient: Query public DKjord WFS feature layers.
+ * DkJordWfsClient: Support class that reads feature layers of the anonymous DKjord WFS.
  *
- * Behavior:
- * - Uses the anonymous DKjord WFS endpoint exposed by Danmarks Miljøportal.
- * - Restricts each request to one official ejerlav code with a server-side CQL filter.
- * - Requests only the properties the caller names, so the response carries no geometry unless the caller names it.
- * - Validates the GeoJSON feature collection before returning source features.
+ * Gives the soil-contamination lookup the features of one ejerlav, checked as a complete GeoJSON
+ * feature collection. Which layer and properties to read, and what a feature means, belong to the
+ * caller.
  *
- * Notes:
- * - This client is internal; public package services own parcel matching and domain semantics.
- * - Layer and property names are supplied by the caller so transport stays independent of classification rules.
- * - The client rejects truncated feature collections instead of silently returning partial results.
+ * Rules:
+ * - Request only the properties the caller names, so no geometry is downloaded unless asked for.
+ * - Never return a feature collection that the server reports as truncated.
  *
  * @internal
  */
-final class DkJordWfsClient {
+class DkJordWfsClient {
 
+	/** App whose cfg and curl service the client uses. */
 	private App $app;
+
+	/** URL of the WFS endpoint, without a trailing slash. */
 	private string $baseUrl;
+
+	/** Request timeout in seconds. */
 	private int|float $timeout;
+
+	/** Connect timeout in seconds. */
 	private int|float $connectTimeout;
 
 	/**
-	 * Create the internal DKjord WFS client and validate package configuration.
+	 * Read and check the DKjord WFS cfg.
 	 *
-	 * @param App $app Application container.
-	 * @throws \UnexpectedValueException When package configuration is invalid.
+	 * @param  App  $app
+	 * @throws \UnexpectedValueException  When cfg danish_public_sector_data.dkjord_wfs has a base_url that is not an HTTPS URL, or a timeout that is not a finite number above 0.
 	 */
 	public function __construct(App $app) {
 		$this->app = $app;
@@ -66,16 +70,24 @@ final class DkJordWfsClient {
 	}
 
 	/**
-	 * Return DKjord features from one WFS layer for one official ejerlav code.
+	 * Return the features of one layer that lie in one ejerlav.
 	 *
-	 * @param string $typeName Exact WFS type name, for example "DKJord:View_Lokaliteter".
-	 * @param int $cadastralDistrictIdentifier Official ejerlav identifier.
-	 * @param list<string> $propertyNames Properties to request: letters, digits and underscores only.
-	 * @return list<array<string,mixed>> GeoJSON features with the requested properties.
-	 * @throws \InvalidArgumentException When the layer name, the district identifier or a property name is invalid.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\RateLimitException When DKjord rate-limits the request.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\RemoteServiceException When transport or HTTP execution fails.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException When the response cannot be interpreted safely.
+	 * Behavior:
+	 * - Selects the features whose Lokalitetsejerlavkode is the ejerlav code, with only the named
+	 *   properties.
+	 * - Every feature returned is a GeoJSON feature with a properties object.
+	 *
+	 * Typical usage:
+	 *   $features = (new DkJordWfsClient($this->app))->getFeatures('DKJord:View_Lokaliteter', 2005352, ['Lokalitetsnr']);
+	 *
+	 * @param  string  $typeName  WFS type of a DKjord view, such as DKJord:View_Lokaliteter.
+	 * @param  int  $cadastralDistrictIdentifier  Official ejerlav code, at least 1.
+	 * @param  list<string>  $propertyNames  Properties to request, in this order: Letters, digits and underscores only.
+	 * @return list<array<string,mixed>>
+	 * @throws \InvalidArgumentException  When the type, the ejerlav code or a property name is invalid, or no property is named.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\RateLimitException  When DKjord rate-limits the request.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\RemoteServiceException  When the request fails or DKjord answers with an unsuccessful status.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the answer is not a complete GeoJSON feature collection.
 	 */
 	public function getFeatures(string $typeName, int $cadastralDistrictIdentifier, array $propertyNames): array {
 		if (!\preg_match('/^DKJord:View_[A-Za-z0-9]+$/D', $typeName)) {
@@ -159,11 +171,11 @@ final class DkJordWfsClient {
 	}
 
 	/**
-	 * Build the WFS property projection from the requested property names.
+	 * Build the PROPERTYNAME projection of a WFS request.
 	 *
-	 * @param list<string> $propertyNames Property names: letters, digits and underscores only.
-	 * @return string Comma-separated WFS property names, in the given order.
-	 * @throws \InvalidArgumentException When the list is empty or a name is not a valid property name.
+	 * @param  list<string>  $propertyNames  Property names: Letters, digits and underscores only.
+	 * @return string  The names separated by commas, in the given order.
+	 * @throws \InvalidArgumentException  When the list is empty or a name has another character.
 	 */
 	private static function buildPropertyNames(array $propertyNames): string {
 		if ($propertyNames === []) {
@@ -181,12 +193,12 @@ final class DkJordWfsClient {
 	}
 
 	/**
-	 * Normalize one configured timeout value.
+	 * Check one timeout from cfg.
 	 *
-	 * @param mixed $value Raw timeout value.
-	 * @param string $name Configuration key name.
-	 * @return int|float Timeout in seconds.
-	 * @throws \UnexpectedValueException When the timeout is invalid.
+	 * @param  mixed  $value  Timeout from cfg.
+	 * @param  string  $name  Cfg key, for the exception message.
+	 * @return int|float  Timeout in seconds.
+	 * @throws \UnexpectedValueException  When the value is not a finite number above 0.
 	 */
 	private function normalizeTimeout(mixed $value, string $name): int|float {
 		if (!\is_int($value) && !\is_float($value)) {

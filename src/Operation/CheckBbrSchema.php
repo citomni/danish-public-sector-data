@@ -21,37 +21,56 @@ use CitOmni\DanishPublicSectorData\Util\BbrSchemaDocument;
 use CitOmni\Kernel\Operation\BaseOperation;
 
 /**
- * Compare live Datafordeler BBR GraphQL schemas with the bundled runtime schemas.
+ * CheckBbrSchema: Operation that compares the live Datafordeler BBR schemas with the schemas the package bundles.
  *
- * Behavior:
- * - Checks the configured current and/or history BBR endpoint.
- * - Fetches Datafordeler's published GraphQL SDL through the documented GET /schema endpoint.
- * - Reads the same full GraphQL SDL documents distributed with the package.
- * - Compares every field and GraphQL type signature for every BBR domain object type.
+ * Gives maintainers a check that the BBR types Datafordeler publishes still match the ones the
+ * package was written against, so a change shows before it breaks a lookup. It reads the bundled
+ * schemas and downloads the live ones; parsing and comparing them belongs to BbrSchemaDocument and
+ * BbrSchemaComparator, and presenting the result to the adapters.
  *
- * Notes:
- * - This is a maintenance operation and performs live network IO plus local file reads.
- * - Generated Connection/Edge pagination types are intentionally ignored by the schema parser.
- * - Runtime schemas live under resources/bbr and are also the canonical inputs for local coverage tests.
- *
- * Typical usage:
- *   $result = (new CheckBbrSchema($app))->execute('all');
- *
- * @param string $scope One of "all", "current", or "history".
- * @return array{status:string,checks:list<array<string,mixed>>} Schema comparison result.
- * @throws \InvalidArgumentException When scope or BBR configuration is invalid.
- * @throws \RuntimeException When a bundled runtime schema cannot be read.
- * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When Datafordeleren cannot be inspected.
+ * Rules:
+ * - Report drift as data, never as an exception.
  */
-final class CheckBbrSchema extends BaseOperation {
+class CheckBbrSchema extends BaseOperation {
 
+	/** No checked endpoint differs from its bundled schema. */
 	public const string RESULT_OK = 'ok';
+
+	/** At least one checked endpoint differs from its bundled schema or has another version. */
 	public const string RESULT_DRIFT = 'drift';
 
+	/** Datafordeler version that the bundled schemas describe. */
 	private const string BUNDLED_VERSION = 'v3';
+
+	/** Bundled schema of the current-state endpoint, in resources/bbr. */
 	private const string CURRENT_SCHEMA_FILE = 'FLEX_CURRENT_V003.schema.graphql';
+
+	/** Bundled schema of the history endpoint, in resources/bbr. */
 	private const string HISTORY_SCHEMA_FILE = 'BBR_V003.schema.graphql';
 
+	/**
+	 * Compare the schemas of the configured BBR endpoints with the bundled ones.
+	 *
+	 * Downloads the GraphQL schema of each endpoint in scope from Datafordeler and compares its BBR
+	 * object types with the bundled schema of that endpoint.
+	 *
+	 * Behavior:
+	 * - checks holds one entry per endpoint in scope, the current-state endpoint first.
+	 * - An endpoint has drift when its BBR types differ from the bundled ones, or when its
+	 *   configured version is not the bundled version.
+	 * - status is RESULT_DRIFT when an endpoint has drift, and RESULT_OK otherwise.
+	 *
+	 * Typical usage:
+	 *   $result = (new CheckBbrSchema($this->app))->execute('all');
+	 *
+	 * @param  string  $scope  all, current or history.
+	 * @return array{status:string,checks:list<array{scope:string,service:string,version:string,bundled_version:string,bundled_schema:string,bundled_type_count:int,remote_type_count:int,version_mismatch:bool,has_drift:bool,new_types:list<string>,removed_types:list<string>,changed_types:array<string,array<string,mixed>>}>}
+	 * @throws \InvalidArgumentException  When the scope is unknown, or cfg danish_public_sector_data.bbr leaves the service or the version of an endpoint in scope empty.
+	 * @throws \UnexpectedValueException  When the Datafordeler cfg is invalid, or a schema holds no BBR object type.
+	 * @throws \RuntimeException  When a bundled schema cannot be read.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a schema cannot be downloaded.
+	 * @see \CitOmni\DanishPublicSectorData\Util\BbrSchemaComparator::compare()  What new_types, removed_types and changed_types hold.
+	 */
 	public function execute(string $scope = 'all'): array {
 		if (!\in_array($scope, ['all', 'current', 'history'], true)) {
 			throw new \InvalidArgumentException('BBR schema-check scope must be all, current, or history.');
@@ -90,7 +109,20 @@ final class CheckBbrSchema extends BaseOperation {
 		return ['status' => self::RESULT_OK, 'checks' => $checks];
 	}
 
-	/** Compare one configured endpoint with one bundled GraphQL SDL document. */
+	/**
+	 * Compare one endpoint with its bundled schema.
+	 *
+	 * @param  DatafordelerClient  $client  Client that downloads the schema.
+	 * @param  string  $scope  current or history.
+	 * @param  string  $service  Datafordeler service of the endpoint.
+	 * @param  string  $version  Version of that service.
+	 * @param  string  $schemaFile  File name of the bundled schema in resources/bbr.
+	 * @return array{scope:string,service:string,version:string,bundled_version:string,bundled_schema:string,bundled_type_count:int,remote_type_count:int,version_mismatch:bool,has_drift:bool,new_types:list<string>,removed_types:list<string>,changed_types:array<string,array<string,mixed>>}
+	 * @throws \InvalidArgumentException  When the service or the version is empty.
+	 * @throws \UnexpectedValueException  When a schema holds no BBR object type.
+	 * @throws \RuntimeException  When the bundled schema cannot be read.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When the schema cannot be downloaded.
+	 */
 	private function checkEndpoint(
 		DatafordelerClient $client,
 		string $scope,
@@ -123,7 +155,13 @@ final class CheckBbrSchema extends BaseOperation {
 		];
 	}
 
-	/** Read one package-distributed GraphQL schema document. */
+	/**
+	 * Read one bundled schema.
+	 *
+	 * @param  string  $filename  File name in resources/bbr.
+	 * @return string  GraphQL SDL; never empty.
+	 * @throws \RuntimeException  When the file cannot be read or is empty.
+	 */
 	private function readBundledSchema(string $filename): string {
 		$path = \dirname(__DIR__, 2) . '/resources/bbr/' . $filename;
 		$source = @\file_get_contents($path);

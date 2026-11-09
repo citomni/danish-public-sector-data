@@ -20,44 +20,42 @@ use CitOmni\DanishPublicSectorData\Support\SkatVatWebClient;
 use CitOmni\Kernel\Service\BaseService;
 
 /**
- * VatRegistration: Check public Danish VAT-registration status.
+ * VatRegistration: Service that tells whether a CVR/SE number is registered for VAT in Denmark.
  *
- * Behavior:
- * - Looks up one exact eight-digit CVR/SE number through SKAT's anonymous public lookup.
- * - Returns a small normalized current-status contract.
- * - Fails when the temporary web integration cannot determine the status explicitly.
+ * Gives host apps a small status contract that does not depend on how SKAT is asked. The answer
+ * comes from SKAT's public web lookup, which is no documented API and may be replaced; the web flow
+ * belongs to SkatVatWebClient.
  *
- * Notes:
- * - The current implementation is a temporary web fallback, not a documented SKAT API contract.
- * - Consumers depend only on this service so the transport can later be replaced transparently.
- * - A CVR number may have separate administrative SE units; the queried number is preserved exactly.
- *
- * Typical usage:
- *   $status = $this->app->vatRegistration->getStatus('12345678');
- *
- * @throws \InvalidArgumentException When the CVR/SE number is not exactly eight digits.
- * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When the remote lookup fails or is inconclusive.
+ * Rules:
+ * - Fail rather than guess when SKAT's answer is not decisive.
+ * - Keep the number as queried: A CVR number can have separate SE numbers for VAT.
  */
-final class VatRegistration extends BaseService {
+class VatRegistration extends BaseService {
 
+	/** Client of SKAT's web lookup. */
 	private SkatVatWebClient $skatVatWeb;
 
 	/**
-	 * Create the internal SKAT web client for this service instance.
+	 * Create the client of SKAT's web lookup.
 	 *
 	 * @return void
+	 * @throws \UnexpectedValueException  When cfg danish_public_sector_data.skat_vat_web is invalid.
+	 * @see \CitOmni\Kernel\Service\BaseService::__construct()  Calls it once per instance.
 	 */
 	protected function init(): void {
 		$this->skatVatWeb = new SkatVatWebClient($this->app);
 	}
 
 	/**
-	 * Return current VAT-registration status for one CVR/SE number.
+	 * Return the current VAT registration of one CVR/SE number.
 	 *
-	 * @param string $registrationNumber Exact eight-digit CVR/SE number.
-	 * @return array{registrationNumber:string,registered:bool,verifiedOn:?string,source:string} Normalized current status.
-	 * @throws \InvalidArgumentException When the CVR/SE number is not exactly eight digits.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException When the remote lookup fails or is inconclusive.
+	 * Typical usage:
+	 *   $status = $this->app->vatRegistration->getStatus('12345678');
+	 *
+	 * @param  string  $registrationNumber  CVR/SE number of exactly eight digits.
+	 * @return array{registrationNumber:string,registered:bool,verifiedOn:?string,source:string}  verifiedOn is the verification date that SKAT shows, as YYYY-MM-DD; source is skat.dk.
+	 * @throws \InvalidArgumentException  When the number is not exactly eight digits.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When the lookup fails or SKAT's answer is not decisive.
 	 */
 	public function getStatus(string $registrationNumber): array {
 		$this->validateRegistrationNumber($registrationNumber);
@@ -76,10 +74,11 @@ final class VatRegistration extends BaseService {
 	}
 
 	/**
-	 * Validate one Danish CVR/SE number without guessing registration semantics.
+	 * Require a CVR/SE number of exactly eight digits.
 	 *
-	 * @param string $registrationNumber Candidate number.
+	 * @param  string  $registrationNumber
 	 * @return void
+	 * @throws \InvalidArgumentException  When the number has another form.
 	 */
 	private function validateRegistrationNumber(string $registrationNumber): void {
 		if (!\preg_match('/^[0-9]{8}$/D', $registrationNumber)) {

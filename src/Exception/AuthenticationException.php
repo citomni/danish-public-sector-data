@@ -16,7 +16,10 @@ declare(strict_types=1);
 namespace CitOmni\DanishPublicSectorData\Exception;
 
 /**
- * Thrown when credentials are missing, rejected, or insufficient for the requested data.
+ * AuthenticationException: Exception for credentials that are missing, empty, rejected or insufficient for the requested data.
+ *
+ * Lets a caller tell a credential or access problem of the host app, which a retry does not fix,
+ * from other failures of a remote service.
  */
-final class AuthenticationException extends RemoteServiceException {
+class AuthenticationException extends RemoteServiceException {
 }
