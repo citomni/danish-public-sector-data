@@ -66,6 +66,7 @@ namespace {
 	require_once $root . '/src/Exception/AuthenticationException.php';
 	require_once $root . '/src/Exception/RateLimitException.php';
 	require_once $root . '/src/Exception/InvalidResponseException.php';
+	require_once $root . '/src/Enum/DatafordelerAuthentication.php';
 	require_once $root . '/src/Support/DatafordelerClient.php';
 	require_once $root . '/src/Service/Cvr.php';
 

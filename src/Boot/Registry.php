@@ -55,6 +55,7 @@ final class Registry {
 		'soilContamination' => \CitOmni\DanishPublicSectorData\Service\SoilContamination::class,
 		'cvr' => \CitOmni\DanishPublicSectorData\Service\Cvr::class,
 		'vatRegistration' => \CitOmni\DanishPublicSectorData\Service\VatRegistration::class,
+		'ejf' => \CitOmni\DanishPublicSectorData\Service\Ejf::class,
 	];
 
 	/**
@@ -91,6 +92,7 @@ final class Registry {
 		'danish_public_sector_data' => [
 			'datafordeler' => [
 				'base_url'        => 'https://graphql.datafordeler.dk', // Datafordeler GraphQL base URL; must be HTTPS.
+				'token_url'       => 'https://auth.datafordeler.dk/realms/distribution/protocol/openid-connect/token', // OAuth token endpoint for Shared Secret clients; must be HTTPS.
 				'timeout'         => 15,                                 // Request timeout in seconds, >= 0.
 				'connect_timeout' => 5,                                  // Connect timeout in seconds, >= 0.
 			],
@@ -116,6 +118,10 @@ final class Registry {
 			],
 			'cvr' => [
 				'service' => 'flexibleCurrent', // Datafordeler service for CVR data; must not be empty.
+				'version' => 'v3',              // Version of that service; must not be empty.
+			],
+			'ejf' => [
+				'service' => 'flexibleCurrent', // Datafordeler service for Ejerfortegnelsen (EJF) data; must not be empty.
 				'version' => 'v3',              // Version of that service; must not be empty.
 			],
 		],
