@@ -130,6 +130,23 @@ including municipality names, floor types, elevator state, and house-number role
 keep a null label so consumers can fall back to the raw value without guessing.
 `codeListSnapshotDate` identifies the bundled code-list snapshot used for the labels.
 
+The addresses of many properties, such as the properties of one owner in EJF, come without
+loading each property:
+
+```php
+$addresses = $this->app->bbr->getAddressesByBfe([4268969, 4268970]);
+```
+
+It returns one entry per distinct BFE number, keyed by the number in the order the numbers first
+occur, with `propertyType` (`sfe`, `bpfg`, `ejerlejlighed`, or `null` when BBR has no current
+property with the number, or several) and `addresses`: the DAR designations of the access
+addresses of an SFE's grounds, of a BPFG's buildings, and the unit addresses, floor and door
+included, of an owner apartment, each once and in natural order. A number with several current
+properties lists the addresses of all of them. The numbers go out 100 per request; a batch asks
+for the properties, then for the grounds, the building relations and buildings, and the unit
+relations and units that its kinds of property need, and the DAR house numbers and addresses of
+the whole call follow, 100 per request.
+
 Technical-installation history is opt-in:
 
 ```php
@@ -144,6 +161,14 @@ and the field coverage of the queries have a local suite that makes no network r
 
 ```bash
 php tests/bbr/run.php
+```
+
+`getAddressesByBfe()` has a suite of its own, which checks its requests and results against
+scripted responses and its query documents against the bundled flexibleCurrent v3 schema,
+without network requests:
+
+```bash
+php tests/bbr-addresses/run.php
 ```
 
 ## Soil contamination lookup
@@ -430,6 +455,18 @@ Both return one entry per distinct BFE number, keyed by the number in the order 
 numbers first occur, with an empty list for a property that EJF has nothing on. Numbers
 are accepted as ints or as strings of digits without leading zeroes.
 
+The properties of a company owner are found by its CVR number:
+
+```php
+$ownerships = $this->app->ejf->getCompanyOwnerships('12345678');
+```
+
+It returns the company's own ownerships, current and former, keyed by BFE number in
+ascending order, each list in the order and shape of `getOwnerships()`. The other owners
+and the transfers of those properties come from `getOwnerships()` and `getTransfers()`.
+A former ownership is the version that ended it, so its `validFrom` is the day the company
+stopped owning the property, not the day it started.
+
 - `getOwnerships()` lists the ownerships of the property, current and former, oldest first
   by `validFrom`. EJF answers with former ownerships at every effect time, so the list is
   the ownership history of the property, with `current` true for the owners now
@@ -462,6 +499,7 @@ process with a Shared Secret is preceded by a token request.
 | Call | Requests |
 |---|---|
 | `getOwnerships()` | Per 100 distinct numbers: 1 per started 100 ownerships (at least 1) |
+| `getCompanyOwnerships()` | 1 per started 100 ownerships of the company (at least 1) |
 | `getTransfers()` | Per 100 distinct numbers: 1 per started 100 transfers (at least 1) |
 
 ### Result shapes

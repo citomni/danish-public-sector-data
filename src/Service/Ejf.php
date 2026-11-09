@@ -26,8 +26,9 @@ use CitOmni\Kernel\Service\BaseService;
  * Ejf: Service that reads the ownerships and ownership changes of Danish properties from Ejerfortegnelsen (EJF).
  *
  * Gives host apps what EJF registers about who owns and has owned a property and how it changed
- * hands, by BFE number and as package-owned arrays: Dates become Danish calendar dates, EJF's
- * placeholders for an unknown date become null, and the upstream GraphQL names stay inside.
+ * hands, by BFE number or by the CVR number of a company owner, as package-owned arrays: Dates
+ * become Danish calendar dates, EJF's placeholders for an unknown date become null, and the
+ * upstream GraphQL names stay inside.
  * Authentication and transport belong to DatafordelerClient; what an ownership or a transfer
  * means for a case, such as who owned a home on a given day, belongs to the caller.
  *
@@ -124,6 +125,9 @@ class Ejf extends BaseService {
 
 	/** BFE number accepted for lookup: Digits without leading zeroes. */
 	private const string BFE_NUMBER_PATTERN = '/^[1-9][0-9]*$/D'; // Numbers become GraphQL Long literals, which cannot start with 0.
+
+	/** CVR number accepted for lookup: Eight digits, the first of them 1-9. */
+	private const string CVR_NUMBER_PATTERN = '/^[1-9][0-9]{7}$/D'; // Numbers become GraphQL Long literals, which cannot start with 0.
 
 	/** Status of a current ownership, and of a transfer that was not rolled back. */
 	private const string CURRENT_STATUS = 'gældende';
@@ -223,11 +227,72 @@ class Ejf extends BaseService {
 		);
 
 		foreach ($ownerships as $bfeNumber => $rows) {
-			\usort($rows, static fn(array $a, array $b): int => [$a['validFrom'] ?? '', $a['id']] <=> [$b['validFrom'] ?? '', $b['id']]);
-			$ownerships[$bfeNumber] = $rows;
+			$ownerships[$bfeNumber] = self::oldestFirst($rows);
 		}
 
 		return $ownerships;
+	}
+
+
+	/**
+	 * Return the ownerships of one company owner, current and former, by its CVR number.
+	 *
+	 * Finds the properties that a company owns or has owned without knowing their BFE numbers.
+	 * The other owners and the transfers of those properties belong to getOwnerships() and
+	 * getTransfers().
+	 *
+	 * Behavior:
+	 * - One entry per property, keyed by BFE number in ascending order. An entry lists the
+	 *   company's ownerships of the property in the order and shape of getOwnerships(), with
+	 *   companyCvr set to the requested number. Empty when EJF has no ownership of the company.
+	 * - Sends one request per page of up to 100 ownerships. Every request of one call uses the
+	 *   same effect time: the time of the call.
+	 *
+	 * Notes:
+	 * - EJF answers with former ownerships at every effect time, so the list holds the properties
+	 *   that the company has owned as well as those it owns now. A former ownership is the
+	 *   version that ended it: Its validFrom is the day it ended, not the day it began.
+	 *
+	 * Typical usage:
+	 *   $ownerships = $this->app->ejf->getCompanyOwnerships('12345678');
+	 *
+	 * @param  int|string  $cvrNumber  Eight digits, the first of them 1-9.
+	 * @return array<int,list<EjfOwnership>>  Ownerships keyed by BFE number.
+	 * @throws \InvalidArgumentException  When the CVR number does not have eight digits or starts with 0.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When the remote lookup fails, or the answer is malformed or holds an ownership of another owner.
+	 * @see \CitOmni\DanishPublicSectorData\Service\Ejf::getOwnerships()  The shape and order of an ownership.
+	 */
+	public function getCompanyOwnerships(int|string $cvrNumber): array {
+		$number = \is_int($cvrNumber) ? (string)$cvrNumber : $cvrNumber;
+		if (!\preg_match(self::CVR_NUMBER_PATTERN, $number)) {
+			throw new \InvalidArgumentException('CVR number must be an int or a string of exactly eight digits, the first of them 1-9.');
+		}
+
+		$effectiveAt = \gmdate('Y-m-d\\TH:i:s\\Z');
+		$rows = [];
+
+		$nodes = $this->connectionNodes(
+			'EJFCustom_EjerskabBegraenset',
+			static fn(?string $after): string => self::companyOwnershipsQuery((int)$number, $effectiveAt, $after)
+		);
+
+		foreach ($nodes as $node) {
+			$row = $this->normalizeOwnership($node);
+			if ($row['companyCvr'] !== $number) {
+				throw new InvalidResponseException('EJF response contains an ownership of another owner.');
+			}
+
+			// A row repeated on a later page is the same registration; the first one wins.
+			$rows[$row['bfeNumber']][$row['id']] ??= $row;
+		}
+
+		\ksort($rows, \SORT_NUMERIC);
+
+		foreach ($rows as $bfeNumber => $ownerships) {
+			$rows[$bfeNumber] = self::oldestFirst($ownerships);
+		}
+
+		return $rows;
 	}
 
 
@@ -384,7 +449,7 @@ class Ejf extends BaseService {
 
 
 	/**
-	 * Build the query document for one page of ownerships.
+	 * Build the query document for one page of the ownerships of properties.
 	 *
 	 * @param  list<int>  $bfeNumbers  At most 100 BFE numbers.
 	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
@@ -392,16 +457,42 @@ class Ejf extends BaseService {
 	 * @return string  GraphQL query document.
 	 */
 	private static function ownershipsQuery(array $bfeNumbers, string $effectiveAt, ?string $after): string {
+		return self::ownershipsDocument('EjfOwnerships', 'bestemtFastEjendomBFENr: { in: [' . \implode(', ', $bfeNumbers) . '] }', $effectiveAt, $after);
+	}
+
+
+	/**
+	 * Build the query document for one page of the ownerships of one company owner.
+	 *
+	 * @param  int  $cvrNumber  CVR number of eight digits.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 */
+	private static function companyOwnershipsQuery(int $cvrNumber, string $effectiveAt, ?string $after): string {
+		return self::ownershipsDocument('EjfCompanyOwnerships', 'ejendeVirksomhedCVRNr: { eq: ' . $cvrNumber . ' }', $effectiveAt, $after);
+	}
+
+
+	/**
+	 * Build the query document for one page of ownerships with the selection that normalizeOwnership() reads.
+	 *
+	 * @param  string  $name  Operation name of the document.
+	 * @param  string  $filter  Filter of the where argument, without its braces.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 */
+	private static function ownershipsDocument(string $name, string $filter, string $effectiveAt, ?string $after): string {
 		$first = self::PAGE_SIZE;
 		$afterArgument = self::afterArgument($after);
-		$numberList = \implode(', ', $bfeNumbers);
 
 		return <<<GRAPHQL
-query EjfOwnerships {
+query {$name} {
 	EJFCustom_EjerskabBegraenset(
 		first: {$first}{$afterArgument}
 		virkningstid: "{$effectiveAt}"
-		where: { bestemtFastEjendomBFENr: { in: [{$numberList}] } }
+		where: { {$filter} }
 	) {
 		nodes {
 			id_lokalId
@@ -583,6 +674,19 @@ GRAPHQL;
 		}
 
 		return \array_keys($unique);
+	}
+
+
+	/**
+	 * Order ownerships oldest first by validFrom, those without a known validFrom first, then by id.
+	 *
+	 * @param  array<array-key,EjfOwnership>  $ownerships
+	 * @return list<EjfOwnership>
+	 */
+	private static function oldestFirst(array $ownerships): array {
+		\usort($ownerships, static fn(array $a, array $b): int => [$a['validFrom'] ?? '', $a['id']] <=> [$b['validFrom'] ?? '', $b['id']]);
+
+		return $ownerships;
 	}
 
 

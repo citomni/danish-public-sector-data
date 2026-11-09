@@ -26,9 +26,9 @@ use CitOmni\Infrastructure\Exception\CurlException;
 
 /*
  * Isolated suite for the ejf service and the Shared Secret flow of DatafordelerClient: The token
- * and query requests, and the ownerships and transfers the service returns, against a scripted
- * transport. No network request is made. Every query document that is sent is also checked
- * against the bundled flexibleCurrent v3 schema.
+ * and query requests, and the ownerships, company ownerships and transfers the service returns,
+ * against a scripted transport. No network request is made. Every query document that is sent is
+ * also checked against the bundled flexibleCurrent v3 schema.
  *
  * The case of a failed token transfer throws the CurlException of citomni/infrastructure, so it
  * needs vendor/: Run "composer install" in the package root first.
@@ -1001,6 +1001,57 @@ foreach ([
 		throws(InvalidResponseException::class, fn() => ejf()->getTransfers([4001]));
 	});
 }
+
+
+// ----------------------------------------------------------------
+// Company ownerships
+// ----------------------------------------------------------------
+
+test('getCompanyOwnerships() filters on the CVR number, follows the pages and keys the ownerships by BFE number in ascending order', function (): void {
+	$company = ['ejerforholdskode' => '30', 'ejendeVirksomhedCVRNr' => 46177975];
+	scriptWithToken([
+		owners([
+			ownership(5003, 'own-c1', $company + ['virkningFra' => '2026-04-30T22:00:00.000000Z']),
+			ownership(5001, 'own-a2', $company + ['virkningFra' => '2026-02-28T23:00:00.000000Z']),
+		], 'cursor-c'),
+		owners([
+			ownership(5001, 'own-a1', $company + ['status' => 'historisk', 'virkningFra' => '2024-12-31T23:00:00.000000Z']),
+			ownership(5003, 'own-c1', $company + ['status' => 'historisk']),
+		]),
+	]);
+	$result = ejf()->getCompanyOwnerships(46177975);
+	$queries = \array_map(queryOf(...), requestsTo(GRAPHQL_URL));
+
+	check(\count($queries) === 2 && \str_contains($queries[0], 'where: { ejendeVirksomhedCVRNr: { eq: 46177975 } }') && !\str_contains($queries[0], 'bestemtFastEjendomBFENr: {'), 'The query filters on the CVR number only.');
+	check(\str_contains($queries[1], 'after: "cursor-c"') && effectTime($queries[0]) === effectTime($queries[1]), 'The next page carries the cursor and the effect time of the first.');
+	check(\array_keys($result) === [5001, 5003], 'Entries are keyed by BFE number in ascending order.');
+	check(\array_column($result[5001], 'id') === ['own-a1', 'own-a2'] && $result[5001][1]['validFrom'] === '2026-03-01', 'The ownerships of a property come oldest first, with Danish dates.');
+	check(\count($result[5003]) === 1 && $result[5003][0]['current'] && $result[5003][0]['companyCvr'] === '46177975' && $result[5003][0]['ownerType'] === 'company', 'A row repeated on a later page is kept once, as it came first, in the shape of getOwnerships().');
+});
+
+test('getCompanyOwnerships() takes the CVR number as a string, and a company without ownerships gives no entries', function (): void {
+	scriptWithToken([owners([])]);
+	check(ejf()->getCompanyOwnerships('46177975') === [], 'No ownerships give no entries.');
+	check(\str_contains(queryOf(requestsTo(GRAPHQL_URL)[0]), 'ejendeVirksomhedCVRNr: { eq: 46177975 }'), 'A string CVR number is sent as a number.');
+});
+
+test('An invalid CVR number is rejected without a request', function (): void {
+	script([]);
+
+	foreach ([1234567, 123456789, 0, -12345678, '01234567', '1234567', '123456789', ' 12345678', '12345678 ', '1234567a', ''] as $invalid) {
+		throws(\InvalidArgumentException::class, fn() => ejf()->getCompanyOwnerships($invalid));
+	}
+
+	check(transport()->requests === [], 'Invalid numbers send no request.');
+});
+
+test('An ownership of another owner in the answer of a company lookup is rejected', function (): void {
+	scriptWithToken([owners([ownership(5001, 'own-x', ['ejerforholdskode' => '30', 'ejendeVirksomhedCVRNr' => 99999999])])]);
+	throws(InvalidResponseException::class, fn() => ejf()->getCompanyOwnerships(46177975));
+
+	scriptWithToken([owners([ownership(5001, 'own-y', ['ejendePersonBegraenset' => person()])])]);
+	throws(InvalidResponseException::class, fn() => ejf()->getCompanyOwnerships(46177975));
+});
 
 
 // ----------------------------------------------------------------

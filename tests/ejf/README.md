@@ -1,6 +1,6 @@
 # EJF suite
 
-Isolated checks for the `ejf` service, `\CitOmni\DanishPublicSectorData\Service\Ejf`, and the Shared Secret flow of `\CitOmni\DanishPublicSectorData\Support\DatafordelerClient`: the token and query requests, and the ownerships and transfers the service returns, against a scripted transport. No network request is made.
+Isolated checks for the `ejf` service, `\CitOmni\DanishPublicSectorData\Service\Ejf`, and the Shared Secret flow of `\CitOmni\DanishPublicSectorData\Support\DatafordelerClient`: the token and query requests, and the ownerships, company ownerships and transfers the service returns, against a scripted transport. No network request is made.
 
 ## Run
 
@@ -11,12 +11,12 @@ php tests/ejf/run.php
 Expected result:
 
 ```
-56 passed, 0 failed
+60 passed, 0 failed
 ```
 
 `PASS` lines go to stdout, `FAIL` lines to stderr. The last line holds the totals, and the exit code is 1 when a check fails.
 
-One case needs `vendor/` from `composer install` in the package root: the transport failure of the token request throws the real `\CitOmni\Infrastructure\Exception\CurlException`. Without `vendor/`, that case fails with a message that says so, and the suite ends with `55 passed, 1 failed`.
+One case needs `vendor/` from `composer install` in the package root: the transport failure of the token request throws the real `\CitOmni\Infrastructure\Exception\CurlException`. Without `vendor/`, that case fails with a message that says so, and the suite ends with `59 passed, 1 failed`.
 
 ## How it works
 
@@ -85,6 +85,10 @@ The curl double keeps every query document sent. The last case checks them all a
 | A transfer with a trade without its transfers is rejected | `handelsoplysningerBeskriverEjerskifte` null |
 | A transfer with a trade transfer without a BFE number is rejected | `bestemtFastEjendomBFENr` null in the trade |
 | A transfer with a missing status is rejected | `status` null |
+| getCompanyOwnerships() filters on the CVR number, follows the pages and keys the ownerships by BFE number in ascending order | The CVR filter, cursor paging, one effect time, ascending BFE numbers, oldest first within a property, a repeated row, the shape of `getOwnerships()` |
+| getCompanyOwnerships() takes the CVR number as a string, and a company without ownerships gives no entries | A string CVR number; an empty result |
+| An invalid CVR number is rejected without a request | Seven and nine digits, zero, negative, a leading zero, padded, a letter, an empty string |
+| An ownership of another owner in the answer of a company lookup is rejected | Another CVR number and a person owner as `InvalidResponseException` |
 | Every query document sent fits the bundled flexibleCurrent v3 schema and queries only the ownership and transfer roots | Every document the suite sent; the two roots |
 
 `php tests/run.php` runs every suite of the package.

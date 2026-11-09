@@ -579,6 +579,188 @@ class Bbr extends BaseService {
 	}
 
 	/**
+	 * Return the addresses of many properties by BFE number.
+	 *
+	 * Describes properties whose BFE numbers come from another register, such as the properties
+	 * of one owner in EJF, without loading each of them; getPropertyByBfe() loads one property
+	 * in full.
+	 *
+	 * Behavior:
+	 * - Returns one entry per distinct BFE number, keyed by that number in the order the numbers
+	 *   first occur.
+	 * - propertyType is sfe, bpfg or ejerlejlighed when BBR has one current property with the
+	 *   number, and null when it has none or several.
+	 * - addresses lists the DAR designations of the property, each once, in natural order: The
+	 *   access addresses of the grounds of a samlet fast ejendom, those of the buildings of a
+	 *   building on foreign ground, and the unit addresses, floor and door included, of an owner
+	 *   apartment. For a number with several current properties, it lists the addresses of all
+	 *   of them. It is empty when BBR has no current property with the number, or DAR has no
+	 *   designation for its objects.
+	 * - Sends the numbers in batches of up to 100. A batch takes one request per page of its
+	 *   properties, one per page of the grounds of its samlet faste ejendomme, one per page of the
+	 *   building relations and of the buildings of its buildings on foreign ground, and one per
+	 *   page of the unit relations and of the units of its owner apartments. The DAR house numbers
+	 *   and addresses of the call then take one request per page of up to 100 ids. Every request
+	 *   of one call uses the same effect time: the time of the call.
+	 *
+	 * Typical usage:
+	 *   $addresses = $this->app->bbr->getAddressesByBfe([4268969, '4268970']);
+	 *
+	 * @param  array<array-key,int|string>  $bfeNumbers  BFE numbers: Positive integers without leading zeroes; surrounding whitespace of a string is ignored. A repeated number is looked up once.
+	 * @return array<int,array{propertyType:?string,addresses:list<string>}>  Addresses keyed by BFE number.
+	 * @throws \InvalidArgumentException  When a BFE number is neither an int nor a string, or not a positive integer without leading zeroes.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a remote lookup fails or is malformed, or BBR answers with a property of a number that was not requested.
+	 */
+	public function getAddressesByBfe(array $bfeNumbers): array {
+		$designations = [];
+		foreach ($bfeNumbers as $bfeNumber) {
+			if (!\is_int($bfeNumber) && !\is_string($bfeNumber)) {
+				throw new \InvalidArgumentException('BFE number must be an int or a string.');
+			}
+
+			$designations[self::normalizeBfeNumber($bfeNumber)] = [];
+		}
+
+		if ($designations === []) {
+			return [];
+		}
+
+		$effectiveAt = self::now();
+		$kinds = [];
+		$houseNumberOwners = [];
+		$addressOwners = [];
+
+		foreach (\array_chunk(\array_keys($designations), self::IDENTIFIER_BATCH_SIZE) as $batch) {
+			$expected = \array_flip($batch);
+			$properties = ['sfe' => [], 'bpfg' => [], 'ejerlejlighed' => []];
+
+			$relations = $this->fetchAll(
+				$this->currentService,
+				$this->currentVersion,
+				'BBR_Ejendomsrelation',
+				fn(?string $after): string => $this->buildPropertiesByBfeNumbersQuery($batch, $effectiveAt, $after)
+			);
+
+			foreach (self::keyById($relations) as $propertyId => $relation) {
+				$bfe = self::nullableInt($relation['bfeNummer'] ?? null);
+				if ($bfe === null || !isset($expected[$bfe])) {
+					throw new InvalidResponseException('BBR returned a property relation of a BFE number that was not requested.');
+				}
+
+				$kind = self::propertyKind(self::requiredString($relation['ejendomstype'] ?? null, 'BBR property type'));
+				$kinds[$bfe][] = $kind;
+				$properties[$kind][$propertyId] = $bfe;
+			}
+
+			foreach (\array_chunk(\array_keys($properties['sfe']), self::IDENTIFIER_BATCH_SIZE) as $propertyIds) {
+				$grounds = $this->fetchAll(
+					$this->currentService,
+					$this->currentVersion,
+					'BBR_Grund',
+					fn(?string $after): string => $this->buildGroundsByPropertiesQuery($propertyIds, $effectiveAt, $after)
+				);
+
+				foreach ($grounds as $ground) {
+					$bfe = $properties['sfe'][self::nullableString($ground['bestemtFastEjendom'] ?? null) ?? ''] ?? null;
+					if ($bfe !== null) {
+						self::addOwner($houseNumberOwners, $ground['husnummer'] ?? null, $bfe);
+					}
+				}
+			}
+
+			foreach (\array_chunk(\array_keys($properties['bpfg']), self::IDENTIFIER_BATCH_SIZE) as $propertyIds) {
+				$buildingOwners = [];
+				$buildingRelations = $this->fetchAll(
+					$this->currentService,
+					$this->currentVersion,
+					'BBR_BygningEjendomsrelation',
+					fn(?string $after): string => $this->buildBuildingRelationsByPropertiesQuery($propertyIds, $effectiveAt, $after)
+				);
+
+				foreach ($buildingRelations as $relation) {
+					$bfe = $properties['bpfg'][self::nullableString($relation['bygningPaaFremmedGrund'] ?? null) ?? ''] ?? null;
+					if ($bfe !== null) {
+						self::addOwner($buildingOwners, $relation['bygning'] ?? null, $bfe);
+					}
+				}
+
+				foreach ($this->fetchBuildingsByIds(\array_keys($buildingOwners), $effectiveAt) as $buildingId => $building) {
+					foreach (\array_keys($buildingOwners[$buildingId] ?? []) as $bfe) {
+						self::addOwner($houseNumberOwners, $building['husnummer'] ?? null, $bfe);
+					}
+				}
+			}
+
+			foreach (\array_chunk(\array_keys($properties['ejerlejlighed']), self::IDENTIFIER_BATCH_SIZE) as $propertyIds) {
+				$unitOwners = [];
+				$unitRelations = $this->fetchAll(
+					$this->currentService,
+					$this->currentVersion,
+					'BBR_EnhedEjendomsrelation',
+					fn(?string $after): string => $this->buildUnitRelationsByPropertiesQuery($propertyIds, $effectiveAt, $after)
+				);
+
+				foreach ($unitRelations as $relation) {
+					$bfe = $properties['ejerlejlighed'][self::nullableString($relation['ejerlejlighed'] ?? null) ?? ''] ?? null;
+					if ($bfe !== null) {
+						self::addOwner($unitOwners, $relation['enhed'] ?? null, $bfe);
+					}
+				}
+
+				foreach ($this->fetchUnitsByIds(\array_keys($unitOwners), $effectiveAt) as $unitId => $unit) {
+					foreach (\array_keys($unitOwners[$unitId] ?? []) as $bfe) {
+						self::addOwner($addressOwners, $unit['adresseIdentificerer'] ?? null, $bfe);
+					}
+				}
+			}
+		}
+
+		$houseNumbers = $this->fetchByIdentifierBatches(
+			'DAR_Husnummer',
+			'id_lokalId',
+			\array_keys($houseNumberOwners),
+			$effectiveAt,
+			fn(string $field, array $ids, ?string $after): string => $this->buildHouseNumbersByIdsQuery($ids, $effectiveAt, $after)
+		);
+
+		foreach ($houseNumbers as $id => $node) {
+			$designation = self::nullableString($node['adgangsadressebetegnelse'] ?? null);
+			foreach ($designation === null ? [] : \array_keys($houseNumberOwners[$id] ?? []) as $bfe) {
+				$designations[$bfe][$designation] = true;
+			}
+		}
+
+		$addresses = $this->fetchByIdentifierBatches(
+			'DAR_Adresse',
+			'id_lokalId',
+			\array_keys($addressOwners),
+			$effectiveAt,
+			fn(string $field, array $ids, ?string $after): string => $this->buildAddressesByIdsQuery($ids, $effectiveAt, $after)
+		);
+
+		foreach ($addresses as $id => $node) {
+			$designation = self::nullableString($node['adressebetegnelse'] ?? null);
+			foreach ($designation === null ? [] : \array_keys($addressOwners[$id] ?? []) as $bfe) {
+				$designations[$bfe][$designation] = true;
+			}
+		}
+
+		$result = [];
+		foreach ($designations as $bfe => $set) {
+			// Keys of a set are strings, apart from a designation of digits only, which PHP keys as an int.
+			$list = \array_map(\strval(...), \array_keys($set));
+			\usort($list, \strnatcasecmp(...));
+
+			$result[$bfe] = [
+				'propertyType' => \count($kinds[$bfe] ?? []) === 1 ? $kinds[$bfe][0] : null,
+				'addresses' => $list,
+			];
+		}
+
+		return $result;
+	}
+
+	/**
 	 * Load the objects of a samlet fast ejendom (SFE).
 	 *
 	 * Behavior:
@@ -2544,6 +2726,20 @@ class Bbr extends BaseService {
 	}
 
 	/**
+	 * Record that an object belongs to a property, when the object id is a UUID.
+	 *
+	 * @param  array<string,array<int,bool>>  $owners  BFE numbers as keys, under the id of each object.
+	 * @param  mixed  $objectId  Raw upstream id of the object.
+	 * @param  int  $bfeNumber  BFE number of the property.
+	 * @return void
+	 */
+	private static function addOwner(array &$owners, mixed $objectId, int $bfeNumber): void {
+		if (\is_string($objectId) && self::isUuid($objectId)) {
+			$owners[$objectId][$bfeNumber] = true;
+		}
+	}
+
+	/**
 	 * Return the bundled label of an optional BBR code.
 	 *
 	 * @param  string  $list  Name of the BBR code list.
@@ -3138,6 +3334,37 @@ GRAPHQL;
 	}
 
 	/**
+	 * Build the query document for one page of the BBR property relations of many BFE numbers, with their type only.
+	 *
+	 * @param  list<int>  $bfeNumbers  At most 100 BFE numbers.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When the cursor cannot be encoded as a GraphQL string.
+	 */
+	private function buildPropertiesByBfeNumbersQuery(array $bfeNumbers, string $effectiveAt, ?string $after): string {
+		$afterArg = self::afterArgument($after);
+		$list = '[' . \implode(',', $bfeNumbers) . ']';
+
+		return <<<GRAPHQL
+query BbrPropertiesByBfeNumbers {
+	BBR_Ejendomsrelation(
+		first: 1000{$afterArg}
+		virkningstid: "{$effectiveAt}"
+		where: { bfeNummer: { in: {$list} } }
+	) {
+		nodes {
+			id_lokalId
+			bfeNummer
+			ejendomstype
+		}
+		{$this->pageInfo()}
+	}
+}
+GRAPHQL;
+	}
+
+	/**
 	 * Build the query document for one page of the grounds of one property.
 	 *
 	 * @param  string  $propertyId  BBR property relation id.
@@ -3160,6 +3387,35 @@ query BbrGroundsByProperty {
 		first: 1000{$afterArg}
 		virkningstid: "{$effectiveAt}"
 		where: { bestemtFastEjendom: { eq: {$id} } }
+	) {
+		nodes {
+			{$this->groundFields()}
+		}
+		{$this->pageInfo()}
+	}
+}
+GRAPHQL;
+	}
+
+	/**
+	 * Build the query document for one page of the grounds of many properties.
+	 *
+	 * @param  list<string>  $propertyIds  At most 100 BBR property relation ids.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
+	private function buildGroundsByPropertiesQuery(array $propertyIds, string $effectiveAt, ?string $after): string {
+		$afterArg = self::afterArgument($after);
+		$list = self::gqlStringList($propertyIds);
+
+		return <<<GRAPHQL
+query BbrGroundsByProperties {
+	BBR_Grund(
+		first: 1000{$afterArg}
+		virkningstid: "{$effectiveAt}"
+		where: { bestemtFastEjendom: { in: {$list} } }
 	) {
 		nodes {
 			{$this->groundFields()}
@@ -3375,6 +3631,37 @@ GRAPHQL;
 	}
 
 	/**
+	 * Build the query document for one page of the building relations of many buildings on foreign ground.
+	 *
+	 * @param  list<string>  $propertyIds  At most 100 BBR property relation ids of buildings on foreign ground.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
+	private function buildBuildingRelationsByPropertiesQuery(array $propertyIds, string $effectiveAt, ?string $after): string {
+		$afterArg = self::afterArgument($after);
+		$list = self::gqlStringList($propertyIds);
+
+		return <<<GRAPHQL
+query BbrBuildingRelationsByProperties {
+	BBR_BygningEjendomsrelation(
+		first: 1000{$afterArg}
+		virkningstid: "{$effectiveAt}"
+		where: { bygningPaaFremmedGrund: { in: {$list} } }
+	) {
+		nodes {
+			id_lokalId
+			bygning
+			bygningPaaFremmedGrund
+		}
+		{$this->pageInfo()}
+	}
+}
+GRAPHQL;
+	}
+
+	/**
 	 * Build the query document for one page of units by their id or the id of their building.
 	 *
 	 * @param  string  $field  id_lokalId or bygning.
@@ -3511,6 +3798,37 @@ query BbrUnitRelationsByProperty {
 		first: 1000{$afterArg}
 		virkningstid: "{$effectiveAt}"
 		where: { ejerlejlighed: { eq: {$id} } }
+	) {
+		nodes {
+			id_lokalId
+			enhed
+			ejerlejlighed
+		}
+		{$this->pageInfo()}
+	}
+}
+GRAPHQL;
+	}
+
+	/**
+	 * Build the query document for one page of the unit relations of many owner apartments.
+	 *
+	 * @param  list<string>  $propertyIds  At most 100 BBR property relation ids of owner apartments.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
+	 * @return string  GraphQL query document.
+	 * @throws \InvalidArgumentException  When a value cannot be encoded as a GraphQL string.
+	 */
+	private function buildUnitRelationsByPropertiesQuery(array $propertyIds, string $effectiveAt, ?string $after): string {
+		$afterArg = self::afterArgument($after);
+		$list = self::gqlStringList($propertyIds);
+
+		return <<<GRAPHQL
+query BbrUnitRelationsByProperties {
+	BBR_EnhedEjendomsrelation(
+		first: 1000{$afterArg}
+		virkningstid: "{$effectiveAt}"
+		where: { ejerlejlighed: { in: {$list} } }
 	) {
 		nodes {
 			id_lokalId
