@@ -11,12 +11,12 @@ php tests/ejf/run.php
 Expected result:
 
 ```
-86 passed, 0 failed
+96 passed, 0 failed
 ```
 
 `PASS` lines go to stdout, `FAIL` lines to stderr. The last line holds the totals, and the exit code is 1 when a check fails.
 
-One case needs `vendor/` from `composer install` in the package root: the transport failure of the token request throws the real `\CitOmni\Infrastructure\Exception\CurlException`. Without `vendor/`, that case fails with a message that says so, and the suite ends with `85 passed, 1 failed`.
+One case needs `vendor/` from `composer install` in the package root: the transport failure of the token request throws the real `\CitOmni\Infrastructure\Exception\CurlException`. Without `vendor/`, that case fails with a message that says so, and the suite ends with `95 passed, 1 failed`.
 
 ## How it works
 
@@ -24,7 +24,7 @@ The real service and `DatafordelerClient` run on an app double with the `datafor
 
 The client keeps an access token for the process, per token endpoint and client id. A case that needs a new token therefore first takes a client id of its own, and a case that does not test the token flow scripts a token answer in front of its own answers.
 
-The curl double keeps every query document sent. The last case checks them all against the bundled `resources/bbr/FLEX_CURRENT_V003.schema.graphql` with `\CitOmni\DanishPublicSectorData\Tests\Support\GraphqlSchema`, checks that the service queries only the roots `EJFCustom_EjerskabBegraenset`, `EJFCustom_PersonEllerVirksomhedsadminiBegraenset` and `EJF_Ejerskifte`, and that the reference joins it follows are only those of the Handelsoplysninger and of `EJFCustom_AlternativAdresseBegraenset`; the schema also offers joins to entities that only public authorities get. It therefore covers the documents of the cases before it.
+The curl double keeps every query document sent. The last case checks them all against the bundled `resources/bbr/FLEX_CURRENT_V003.schema.graphql` with `\CitOmni\DanishPublicSectorData\Tests\Support\GraphqlSchema`, checks that the service queries only the roots `EJFCustom_EjerskabBegraenset`, `EJFCustom_PersonEllerVirksomhedsadminiBegraenset` and `EJF_Ejerskifte`, and that the reference joins it follows are only those of the Handelsoplysninger, of the share transfers (`EJF_Ejerskabsskifte`) and of `EJFCustom_AlternativAdresseBegraenset`; the schema also offers joins to entities that only public authorities get. It therefore covers the documents of the cases before it.
 
 ## Checks
 
@@ -74,7 +74,9 @@ The curl double keeps every query document sent. The last case checks them all a
 | An ownership with a CVR number that is not a number is rejected | `ejendeVirksomhedCVRNr` "12345678" |
 | An ownership with owner information that is not an object is rejected | `oplysningerEjesAfEjerskab` "Boet" |
 | Transfers come oldest first by takeover date, unknown dates first, and rolled-back transfers are left out | Order, rolled-back transfers |
-| A transfer keeps its dates as Danish dates, and its trade lists each current property of the trade once | The complete record of a sale with trade information |
+| A transfer keeps its dates as Danish dates, and its trade lists each current property of the trade once | The complete record of a sale with trade information, object id and share transfers: ordered by id, a rolled-back one left out, a repeated one kept once |
+| A transfer without an object id or share transfers has objectId null and no share transfers | `objectid` null and an empty share transfer connection |
+| A transfer lookup selects the object id and the current share transfers of every transfer, up to 1000 a transfer | The selection of the transfer document |
 | A placeholder takeover date becomes null, a takeover after midnight keeps its Danish date, and a transfer without trade information has trade null | Placeholder and Danish dates, `trade` null |
 | A rolled-back transfer is left out before its values are read | Invalid values of a rolled-back transfer |
 | A transfer with a missing takeover date is rejected | `overtagelsesdato` null |
@@ -85,6 +87,14 @@ The curl double keeps every query document sent. The last case checks them all a
 | A transfer with a trade without its transfers is rejected | `handelsoplysningerBeskriverEjerskifte` null |
 | A transfer with a trade transfer without a BFE number is rejected | `bestemtFastEjendomBFENr` null in the trade |
 | A transfer with a missing status is rejected | `status` null |
+| A transfer with an object id that is not a positive integer is rejected | `objectid` "307000123" |
+| A transfer with no share transfer connection is rejected | The share transfer connection null |
+| A transfer with share transfers without their page information is rejected | A connection without `pageInfo` |
+| A transfer with more share transfers than one page is rejected | `hasNextPage` true |
+| A transfer with a share transfer without an id is rejected | `id_lokalId` null on a share transfer |
+| A transfer with a share transfer without a status is rejected | `status` null on a share transfer |
+| A transfer with a received share without its denominator is rejected | `modtagetAndel_naevner` null next to a numerator |
+| A transfer with a giving ownership id that is not text is rejected | `afgivendeEjerobjektLokalId` 42 |
 | getCompanyOwnerships() filters on the CVR number, follows the pages and keys the ownerships by BFE number in ascending order | The CVR filter, cursor paging, one effect time, ascending BFE numbers, oldest first within a property, a repeated row, the shape of `getOwnerships()` |
 | getCompanyOwnerships() takes the CVR number as a string, and a company without ownerships gives no entries | A string CVR number; an empty result |
 | An invalid CVR number is rejected without a request | Seven and nine digits, zero, negative, a leading zero, padded, a letter, an empty string |
@@ -115,6 +125,6 @@ The curl double keeps every query document sent. The last case checks them all a
 | An administration with owner information that is not an object is rejected | `personEllerVirksomhedsadministratorErPersonEllerVirksomhedsoplysninger` "Boet" |
 | An administration with an alternative address that is not an object is rejected | The alternative address as a string |
 | An administration with an alternative address without a status is rejected | `status` null on the alternative address |
-| Every query document sent fits the bundled flexibleCurrent v3 schema and queries only the ownership, transfer and administration roots and joins of the private-actor entities | Every document the suite sent; the three roots; the two reference joins |
+| Every query document sent fits the bundled flexibleCurrent v3 schema and queries only the ownership, transfer and administration roots and joins of the private-actor entities | Every document the suite sent; the three roots; the three reference joins |
 
 `php tests/run.php` runs every suite of the package.

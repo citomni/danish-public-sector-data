@@ -471,7 +471,8 @@ The provider exposes `ejf` for Ejerfortegnelsen (EJF), the Danish register of wh
 real property, through Datafordeler `flexibleCurrent/v3`. EJF is access-restricted: the
 service authenticates with the Shared Secret (see [Datafordeler credentials](#datafordeler-credentials)).
 It queries only `EJFCustom_EjerskabBegraenset` with its `ejendePersonBegraenset` and
-`oplysningerEjesAfEjerskab` joins, `EJF_Ejerskifte` with its Handelsoplysninger join, and
+`oplysningerEjesAfEjerskab` joins, `EJF_Ejerskifte` with its Handelsoplysninger join and the
+`EJF_Ejerskabsskifte` rows that name it, and
 `EJFCustom_PersonEllerVirksomhedsadminiBegraenset` with its `administreretPersonBegraenset`,
 `personBegraenset` and `personEllerVirksomhedsadministratorErPersonEllerVirksomhedsoplysninger`
 joins and the `EJFCustom_AlternativAdresseBegraenset` of that owner information.
@@ -504,9 +505,9 @@ stopped owning the property, not the day it started.
   by `validFrom`. EJF answers with former ownerships at every effect time, so the list is
   the ownership history of the property, with `current` true for the owners now
   (status `gældende`) and false for the former ones (status `historisk`).
-- `getTransfers()` lists the ownership changes (Ejerskifte) with their trade information,
-  oldest first by `takeoverDate`. Rolled-back registrations (status `tilbagerullet`) are
-  left out.
+- `getTransfers()` lists the ownership changes (Ejerskifte) with their trade information
+  and their share transfers, oldest first by `takeoverDate`. Rolled-back registrations
+  (status `tilbagerullet`) are left out, of transfers and of share transfers.
 - EJF stores calendar dates as instants of Danish midnight. The service returns them as
   Danish dates, `YYYY-MM-DD`, and EJF's placeholders for an unknown date, the start of the
   year 1, 1 January 1800 and 1 January 1970, as `null`.
@@ -520,8 +521,9 @@ stopped owning the property, not the day it started.
   as a foreign owner or an estate) or `unknown`.
 - One trade can cover several properties for one price; `trade.bfeNumbers` lists them, at
   most 100.
-- The conversion from the former ownership register left some trades twice, with the same
-  takeover date, method and price. The lists keep both.
+- The conversion from the former ownership register split a deed with several buyers into
+  one transfer per buyer, each with an even part of the price and the share transfers of the
+  whole deed. The lists keep the parts.
 
 ### Administrators
 
@@ -642,6 +644,7 @@ Transfer:
 ```php
 [
 	'id' => '3b9d...',
+	'objectId' => 307123456,
 	'bfeNumber' => 4268969,
 	'takeoverDate' => '2019-07-01',
 	'filedDate' => '2019-07-11',
@@ -663,6 +666,22 @@ Transfer:
 		'buildings' => 'Enfamiliesejendom',
 		'bfeNumbers' => [4268969],
 	],
+	'shareTransfers' => [
+		[
+			'id' => '5c01...',
+			'givingOwnershipId' => '1d7f...',
+			'givenShare' => ['numerator' => 1, 'denominator' => 1],
+			'receivingOwnershipId' => null,
+			'receivedShare' => null,
+		],
+		[
+			'id' => '8a22...',
+			'givingOwnershipId' => null,
+			'givenShare' => null,
+			'receivingOwnershipId' => '6e90...',
+			'receivedShare' => ['numerator' => 1, 'denominator' => 2],
+		],
+	],
 ]
 ```
 
@@ -674,6 +693,13 @@ Transfer:
 - `trade.totalPrice` is the samlet købesum, `cashPrice` the kontant købesum and
   `movablesPrice` the løsøresum, in `currency`; `disposalDate` is the afståelsesdato.
   `trade` is `null` when EJF has no trade information for the transfer.
+- `shareTransfers` are the transfer's share transfers (Ejerskabsskifte) with status
+  `gældende`, ordered by `id`. Each names the ownership that gives up a share, with
+  `givenShare` the part of its own share that it gives up, or the ownership that receives
+  one, with `receivedShare` the part of the property that it receives. The ownership ids are
+  the `id` of the ownerships of `getOwnerships()`, so the shares tell which ownerships a
+  transfer ended and began. A transfer with more than 1000 share transfers fails the lookup.
+- `objectId` is EJF's object id of the transfer, `null` when EJF gives none.
 
 Administration:
 

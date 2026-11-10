@@ -37,8 +37,9 @@ use CitOmni\Kernel\Service\BaseService;
  *
  * Rules:
  * - Query only CustomEjerskabBegraenset with its person and owner-information joins, Ejerskifte
- *   and Handelsoplysninger, and CustomPersonEllerVirksomhedsadminiBegraenset with its person and
- *   owner-information joins and the CustomAlternativAdresseBegraenset of that owner information.
+ *   with its Handelsoplysninger and Ejerskabsskifte, and
+ *   CustomPersonEllerVirksomhedsadminiBegraenset with its person and owner-information joins and
+ *   the CustomAlternativAdresseBegraenset of that owner information.
  *   Datafordeler refuses a query as a whole when it touches an entity outside the host app's
  *   access, so another entity or join needs a query of its own.
  * - Return what EJF holds; never fill a value in from another register.
@@ -103,8 +104,16 @@ use CitOmni\Kernel\Service\BaseService;
  *     buildings:?string,
  *     bfeNumbers:list<int>
  * }
+ * @phpstan-type EjfShareTransfer array{
+ *     id:string,
+ *     givingOwnershipId:?string,
+ *     givenShare:EjfShare|null,
+ *     receivingOwnershipId:?string,
+ *     receivedShare:EjfShare|null
+ * }
  * @phpstan-type EjfTransfer array{
  *     id:string,
+ *     objectId:?int,
  *     bfeNumber:int,
  *     takeoverDate:?string,
  *     filedDate:?string,
@@ -114,7 +123,8 @@ use CitOmni\Kernel\Service\BaseService;
  *     conditional:?bool,
  *     deadline:?string,
  *     documentId:?string,
- *     trade:EjfTrade|null
+ *     trade:EjfTrade|null,
+ *     shareTransfers:list<EjfShareTransfer>
  * }
  * @phpstan-type EjfPersonDates array{id:string,status:string,statusDate:string,birthDate:string}
  * @phpstan-type EjfAlternativeAddress array{status:string,current:bool,lines:list<string>,countryCode:?string}
@@ -171,6 +181,9 @@ class Ejf extends BaseService {
 
 	/** Maximum number of the transfers of a trade that are read to list the properties of the trade. */
 	private const int TRADE_TRANSFER_LIMIT = 100;
+
+	/** Maximum number of the share transfers of one transfer that are read; a transfer with more fails the lookup. */
+	private const int SHARE_TRANSFER_LIMIT = 1000; // The largest page that Datafordeler serves.
 
 	/** Maximum number of object ids in one in filter, and the page size of a lookup by object ids. */
 	private const int OBJECT_ID_BATCH_SIZE = 100; // Datafordeler accepts at most 100 values in an in filter.
@@ -449,12 +462,19 @@ GRAPHQL;
 	 * - trade holds the trade information (Handelsoplysninger) when EJF has it. One trade can
 	 *   cover several properties for one price; trade.bfeNumbers lists them, at most 100.
 	 * - Amounts are in trade.currency. An amount, and the currency, is null when EJF has none.
+	 * - shareTransfers lists the share transfers (Ejerskabsskifte) of the transfer with status
+	 *   gældende, ordered by id. A share transfer names the ownership that gives up a share, with
+	 *   givenShare the part of its own share that it gives up, or the ownership that receives one,
+	 *   with receivedShare the part of the property that it receives. An ownership id is the id of
+	 *   an ownership that getOwnerships() returns.
+	 * - objectId is null when EJF gives the transfer none.
 	 * - Sends the numbers in batches of up to 100, one request per page of up to 100 transfers.
 	 *   Every request of one call uses the same effect time: the time of the call.
 	 *
 	 * Notes:
-	 * - The conversion from the former ownership register left some trades twice, with the same
-	 *   takeover date, method and price. The list keeps both.
+	 * - The conversion from the former ownership register split a deed with several buyers into
+	 *   one transfer per buyer, each with an even part of the price and the share transfers of the
+	 *   whole deed. The list keeps the parts.
 	 *
 	 * Typical usage:
 	 *   $transfers = $this->app->ejf->getTransfers([4268969]);
@@ -462,7 +482,7 @@ GRAPHQL;
 	 * @param  array<array-key,int|string>  $bfeNumbers  BFE numbers as ints or strings of digits without leading zeroes. A repeated number is looked up once.
 	 * @return array<int,list<EjfTransfer>>  Transfers keyed by BFE number.
 	 * @throws \InvalidArgumentException  When a BFE number is not a positive integer without leading zeroes.
-	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a remote lookup fails or is malformed.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a remote lookup fails or is malformed, or a transfer has more than 1000 share transfers.
 	 */
 	public function getTransfers(array $bfeNumbers): array {
 		$transfers = $this->rowsByBfe(
@@ -929,6 +949,7 @@ GRAPHQL;
 	private static function transfersQuery(array $bfeNumbers, string $effectiveAt, ?string $after): string {
 		$first = self::PAGE_SIZE;
 		$tradeFirst = self::TRADE_TRANSFER_LIMIT;
+		$shareFirst = self::SHARE_TRANSFER_LIMIT;
 		$afterArgument = self::afterArgument($after);
 		$numberList = \implode(', ', $bfeNumbers);
 
@@ -941,6 +962,7 @@ query EjfTransfers {
 	) {
 		nodes {
 			id_lokalId
+			objectid
 			bestemtFastEjendomBFENr
 			status
 			overdragelsesmaade
@@ -966,6 +988,21 @@ query EjfTransfers {
 						status
 						bestemtFastEjendomBFENr
 					}
+				}
+			}
+			id_lokalId_23_Ejerskabsskifte_ejerskifteLokalId_ref(first: {$shareFirst}) {
+				nodes {
+					id_lokalId
+					status
+					afgivendeEjerobjektLokalId
+					afstaaetAndel_taeller
+					afstaaetAndel_naevner
+					modtagendeEjerobjektLokalId
+					modtagetAndel_taeller
+					modtagetAndel_naevner
+				}
+				pageInfo {
+					hasNextPage
 				}
 			}
 		}
@@ -1334,9 +1371,11 @@ GRAPHQL;
 		}
 
 		$conditional = $node['betinget'] ?? null;
+		$objectId = $node['objectid'] ?? null;
 
 		return [
 			'id' => $id,
+			'objectId' => $objectId === null ? null : self::positiveInt($objectId, 'transfer object id'),
 			'bfeNumber' => $bfeNumber,
 			'takeoverDate' => $this->instantDate($node['overtagelsesdato'] ?? null, 'takeover date', true),
 			'filedDate' => $this->instantDate($node['anmeldelsesdato'] ?? null, 'filing date', false),
@@ -1347,7 +1386,48 @@ GRAPHQL;
 			'deadline' => ($node['fristDato'] ?? null) === null ? null : self::localDate($node['fristDato'], 'transfer deadline'),
 			'documentId' => self::nullableText($node['anmeldelsesidentifikator'] ?? null, 'filing identifier'),
 			'trade' => self::normalizeTrade($node['handelsoplysningerLokalId_23_Handelsoplysninger_id_lokalId_ref'] ?? null),
+			'shareTransfers' => self::normalizeShareTransfers($node['id_lokalId_23_Ejerskabsskifte_ejerskifteLokalId_ref'] ?? null),
 		];
+	}
+
+
+	/**
+	 * Normalize the share transfers of a transfer, leaving out rolled-back ones.
+	 *
+	 * @param  mixed  $connection  Raw connection of EJF_Ejerskabsskifte nodes.
+	 * @return list<EjfShareTransfer>  Ordered by id; a share transfer that comes twice is kept once.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\InvalidResponseException  When the connection or a node is invalid, or the connection has a next page.
+	 */
+	private static function normalizeShareTransfers(mixed $connection): array {
+		if (!\is_array($connection) || !\is_array($connection['nodes'] ?? null) || !\is_bool($connection['pageInfo']['hasNextPage'] ?? null)) {
+			throw new InvalidResponseException('EJF response contains invalid share transfers of a transfer.');
+		}
+		if ($connection['pageInfo']['hasNextPage']) {
+			throw new InvalidResponseException('EJF response has more than ' . self::SHARE_TRANSFER_LIMIT . ' share transfers of one transfer.');
+		}
+
+		$shareTransfers = [];
+		foreach ($connection['nodes'] as $node) {
+			if (!\is_array($node)) {
+				throw new InvalidResponseException('EJF response contains an invalid share transfer.');
+			}
+			if (self::requiredString($node['status'] ?? null, 'share transfer status') !== self::CURRENT_STATUS) {
+				continue;
+			}
+
+			$id = self::requiredString($node['id_lokalId'] ?? null, 'share transfer id');
+			$shareTransfers[$id] ??= [
+				'id' => $id,
+				'givingOwnershipId' => self::nullableText($node['afgivendeEjerobjektLokalId'] ?? null, 'giving ownership id'),
+				'givenShare' => self::share($node['afstaaetAndel_taeller'] ?? null, $node['afstaaetAndel_naevner'] ?? null, 'given share'),
+				'receivingOwnershipId' => self::nullableText($node['modtagendeEjerobjektLokalId'] ?? null, 'receiving ownership id'),
+				'receivedShare' => self::share($node['modtagetAndel_taeller'] ?? null, $node['modtagetAndel_naevner'] ?? null, 'received share'),
+			];
+		}
+
+		\ksort($shareTransfers, \SORT_STRING);
+
+		return \array_values($shareTransfers);
 	}
 
 

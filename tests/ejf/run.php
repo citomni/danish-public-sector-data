@@ -446,7 +446,40 @@ function trade(array $values = []): array {
 
 
 /**
- * Build a current transfer without trade information.
+ * Build a current share transfer that gives an ownership a share of the property.
+ *
+ * @param  string  $id
+ * @param  array<string,mixed>  $values  Values that replace the defaults.
+ * @return array<string,mixed>
+ */
+function shareTransfer(string $id, array $values = []): array {
+	return \array_replace([
+		'id_lokalId' => $id,
+		'status' => 'gældende',
+		'afgivendeEjerobjektLokalId' => null,
+		'afstaaetAndel_taeller' => null,
+		'afstaaetAndel_naevner' => null,
+		'modtagendeEjerobjektLokalId' => 'own-buyer',
+		'modtagetAndel_taeller' => 1,
+		'modtagetAndel_naevner' => 1,
+	], $values);
+}
+
+
+/**
+ * Build the connection of the share transfers of a transfer.
+ *
+ * @param  list<array<string,mixed>>  $nodes
+ * @param  bool  $more  True when the connection has a next page.
+ * @return array<string,mixed>
+ */
+function shareTransfers(array $nodes, bool $more = false): array {
+	return ['nodes' => $nodes, 'pageInfo' => ['hasNextPage' => $more]];
+}
+
+
+/**
+ * Build a current transfer without trade information or share transfers.
  *
  * @param  int  $bfeNumber
  * @param  string  $id
@@ -456,6 +489,7 @@ function trade(array $values = []): array {
 function transfer(int $bfeNumber, string $id, array $values = []): array {
 	return \array_replace([
 		'id_lokalId' => $id,
+		'objectid' => null,
 		'bestemtFastEjendomBFENr' => $bfeNumber,
 		'status' => 'gældende',
 		'overdragelsesmaade' => 'Almindelig fri handel',
@@ -467,6 +501,7 @@ function transfer(int $bfeNumber, string $id, array $values = []): array {
 		'forretningshaendelse' => 'Endeligt skøde',
 		'forretningsproces' => 'Hændelse fra Digital Tinglysning',
 		'handelsoplysningerLokalId_23_Handelsoplysninger_id_lokalId_ref' => null,
+		'id_lokalId_23_Ejerskabsskifte_ejerskifteLokalId_ref' => shareTransfers([]),
 	], $values);
 }
 
@@ -552,14 +587,26 @@ function ownershipsOfEveryKind(): array {
 
 
 /**
- * Look up the transfers of property 4001: A sale, a rolled-back transfer, a transfer with a
- * placeholder takeover date and a deed without trade information.
+ * Look up the transfers of property 4001: A sale with its share transfers, a rolled-back transfer,
+ * a transfer with a placeholder takeover date and a deed without trade information.
  *
  * @return array<string,array<string,mixed>>  Transfers keyed by id, in the order the service returns them.
  */
 function transfersOfEveryKind(): array {
 	scriptWithToken([changes([
-		transfer(4001, 'tr-sale', ['handelsoplysningerLokalId_23_Handelsoplysninger_id_lokalId_ref' => trade([
+		transfer(4001, 'tr-sale', ['objectid' => 307000123, 'id_lokalId_23_Ejerskabsskifte_ejerskifteLokalId_ref' => shareTransfers([
+			shareTransfer('st-3'),
+			shareTransfer('st-2', ['status' => 'tilbagerullet', 'modtagendeEjerobjektLokalId' => 'own-rolled-back']),
+			shareTransfer('st-1', [
+				'afgivendeEjerobjektLokalId' => 'own-seller',
+				'afstaaetAndel_taeller' => 1,
+				'afstaaetAndel_naevner' => 1,
+				'modtagendeEjerobjektLokalId' => null,
+				'modtagetAndel_taeller' => null,
+				'modtagetAndel_naevner' => null,
+			]),
+			shareTransfer('st-3', ['modtagendeEjerobjektLokalId' => 'own-repeat']),
+		]), 'handelsoplysningerLokalId_23_Handelsoplysninger_id_lokalId_ref' => trade([
 			'handelsoplysningerBeskriverEjerskifte' => ['nodes' => [
 				['status' => 'gældende', 'bestemtFastEjendomBFENr' => 4002],
 				['status' => 'gældende', 'bestemtFastEjendomBFENr' => 4001],
@@ -1059,6 +1106,7 @@ test('Transfers come oldest first by takeover date, unknown dates first, and rol
 test('A transfer keeps its dates as Danish dates, and its trade lists each current property of the trade once', function (): void {
 	check(transfersOfEveryKind()['tr-sale'] === [
 		'id' => 'tr-sale',
+		'objectId' => 307000123,
 		'bfeNumber' => 4001,
 		'takeoverDate' => '2019-07-01',
 		'filedDate' => '2019-07-11',
@@ -1080,7 +1128,28 @@ test('A transfer keeps its dates as Danish dates, and its trade lists each curre
 			'buildings' => 'Enfamiliesejendom',
 			'bfeNumbers' => [4001, 4002],
 		],
-	], 'A transfer keeps its dates as Danish dates, and its trade lists each current property of the trade once.');
+		'shareTransfers' => [
+			['id' => 'st-1', 'givingOwnershipId' => 'own-seller', 'givenShare' => ['numerator' => 1, 'denominator' => 1], 'receivingOwnershipId' => null, 'receivedShare' => null],
+			['id' => 'st-3', 'givingOwnershipId' => null, 'givenShare' => null, 'receivingOwnershipId' => 'own-buyer', 'receivedShare' => ['numerator' => 1, 'denominator' => 1]],
+		],
+	], 'A transfer keeps its dates as Danish dates, its trade lists each current property of the trade once, and its share transfers come by id, current ones once each.');
+});
+
+test('A transfer without an object id or share transfers has objectId null and no share transfers', function (): void {
+	$deed = transfersOfEveryKind()['tr-deed'];
+
+	check($deed['objectId'] === null && $deed['shareTransfers'] === [], 'A transfer without an object id or share transfers has objectId null and no share transfers.');
+});
+
+test('A transfer lookup selects the object id and the current share transfers of every transfer, up to 1000 a transfer', function (): void {
+	transfersOfEveryKind();
+	$query = queryOf(requestsTo(GRAPHQL_URL)[0]);
+
+	check(
+		\str_contains($query, "\t\t\tobjectid\n") && \str_contains($query, 'id_lokalId_23_Ejerskabsskifte_ejerskifteLokalId_ref(first: 1000) {')
+			&& \str_contains($query, 'afgivendeEjerobjektLokalId') && \str_contains($query, 'modtagetAndel_naevner'),
+		'A transfer lookup selects the object id and the share transfers, up to 1000 a transfer.'
+	);
 });
 
 test('A placeholder takeover date becomes null, a takeover after midnight keeps its Danish date, and a transfer without trade information has trade null', function (): void {
@@ -1117,6 +1186,14 @@ foreach ([
 	'a trade without its transfers' => ['handelsoplysningerLokalId_23_Handelsoplysninger_id_lokalId_ref' => trade(['handelsoplysningerBeskriverEjerskifte' => null])],
 	'a trade transfer without a BFE number' => ['handelsoplysningerLokalId_23_Handelsoplysninger_id_lokalId_ref' => trade(['handelsoplysningerBeskriverEjerskifte' => ['nodes' => [['status' => 'gældende', 'bestemtFastEjendomBFENr' => null]]]])],
 	'a missing status' => ['status' => null],
+	'an object id that is not a positive integer' => ['objectid' => '307000123'],
+	'no share transfer connection' => ['id_lokalId_23_Ejerskabsskifte_ejerskifteLokalId_ref' => null],
+	'share transfers without their page information' => ['id_lokalId_23_Ejerskabsskifte_ejerskifteLokalId_ref' => ['nodes' => []]],
+	'more share transfers than one page' => ['id_lokalId_23_Ejerskabsskifte_ejerskifteLokalId_ref' => shareTransfers([shareTransfer('st-1')], true)],
+	'a share transfer without an id' => ['id_lokalId_23_Ejerskabsskifte_ejerskifteLokalId_ref' => shareTransfers([shareTransfer('st-1', ['id_lokalId' => null])])],
+	'a share transfer without a status' => ['id_lokalId_23_Ejerskabsskifte_ejerskifteLokalId_ref' => shareTransfers([shareTransfer('st-1', ['status' => null])])],
+	'a received share without its denominator' => ['id_lokalId_23_Ejerskabsskifte_ejerskifteLokalId_ref' => shareTransfers([shareTransfer('st-1', ['modtagetAndel_naevner' => null])])],
+	'a giving ownership id that is not text' => ['id_lokalId_23_Ejerskabsskifte_ejerskifteLokalId_ref' => shareTransfers([shareTransfer('st-1', ['afgivendeEjerobjektLokalId' => 42])])],
 ] as $invalid => $values) {
 	test('A transfer with ' . $invalid . ' is rejected', function () use ($values): void {
 		scriptWithToken([changes([transfer(4001, 'tr-bad', $values)])]);
@@ -1420,7 +1497,7 @@ test('Every query document sent fits the bundled flexibleCurrent v3 schema and q
 	);
 	// The schema also offers joins to the entities that only public authorities get, such as EJF_AlternativAdresse.
 	check(
-		\array_keys($joins) === ['alternativAdresseLokalId_23_AlternativAdresseBegraenset_id_lokalId_ref', 'handelsoplysningerLokalId_23_Handelsoplysninger_id_lokalId_ref'],
+		\array_keys($joins) === ['alternativAdresseLokalId_23_AlternativAdresseBegraenset_id_lokalId_ref', 'handelsoplysningerLokalId_23_Handelsoplysninger_id_lokalId_ref', 'id_lokalId_23_Ejerskabsskifte_ejerskifteLokalId_ref'],
 		'The service follows only the reference joins to entities that a private actor may use.'
 	);
 });
