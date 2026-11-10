@@ -547,7 +547,7 @@ test('A supplementary town name after the house number is not taken for a floor 
 	check(transport()->responses === [], 'Every scripted answer is asked for.');
 });
 
-test('A supplementary town name after a floor and a door is left out, so the owner apartment is selected', function (): void {
+test('The DAR designation of an owner apartment, with its supplementary town name, selects that apartment', function (): void {
 	script([
 		...dar('own-building', true, 'Tofterup'),
 		page('BBR_Bygning', [building('own-building', 'own-ground')]),
@@ -557,9 +557,11 @@ test('A supplementary town name after a floor and a door is left out, so the own
 		page('BBR_EnhedEjendomsrelation', [['id_lokalId' => IDS['unit-relation-2'], 'enhed' => IDS['unit-2'], 'ejerlejlighed' => IDS['apartment-2']]]),
 		page('BBR_Ejendomsrelation', [property('own-property', 2001, '1'), property('apartment-2', 2102, '3')]),
 	]);
-	$result = bbr()->resolveAddress('Eksempelvej 10L, 1. tv, Tofterup, 7200 Grindsted');
+	// The designation that DAR answers for address-2 above.
+	$designation = 'Eksempelvej 10L, 1. tv, Tofterup, 7200 Grindsted';
+	$result = bbr()->resolveAddress($designation);
 
-	check($result['matchedAddress'] === 'Eksempelvej 10L, 1. tv, Tofterup, 7200 Grindsted', 'The address of the typed floor and door is selected.');
+	check($result['matchedAddress'] === $designation, 'The designation selects its own address.');
 	check($result['parsed']['unit'] === ['raw' => '1. tv', 'floor' => '1', 'door' => 'tv'], 'The floor and door are read without the town name.');
 	check($result['status'] === 'resolved' && $result['selectedBfeNumber'] === 2102, 'The owner apartment of the unit at the address is selected.');
 	check($result['bfeCandidates'] === [candidate(2001, 'sfe', 'own-property', ['ground_sfe']), candidate(2102, 'ejerlejlighed', 'apartment-2', ['selected_unit_ejerlejlighed'])], 'The SFE and the owner apartment of the selected unit are candidates.');

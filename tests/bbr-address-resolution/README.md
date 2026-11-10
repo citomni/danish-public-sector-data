@@ -35,7 +35,7 @@ The curl double keeps every query document sent. The last case checks them all a
 | A house number whose own building has no property and that gives access to no other building stays no_bfe | The entrance request; no second request for the house number's own building |
 | A house number whose own building has a property resolves through it, without asking for entrances | `selected_unit_ejerlejlighed` over `ground_sfe` with a selected address; the SFE without one; no entrance request |
 | A supplementary town name after the house number is not taken for a floor and a door | The only address of the house number selected; no floor and door left; the units asked for by the selected address |
-| A supplementary town name after a floor and a door is left out, so the owner apartment is selected | The floor and door read without the town name; `selected_unit_ejerlejlighed` |
+| The DAR designation of an owner apartment, with its supplementary town name, selects that apartment | DAR's own designation read back as typed address; the floor and door without the town name; `selected_unit_ejerlejlighed` |
 | A part that DAR does not write for the house number is still read as a floor and a door | Nothing left out for another name; no address selected; the only candidate still selected |
 | Every query document sent fits the bundled flexibleCurrent v3 schema | Every document the suite sent |
 

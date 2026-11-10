@@ -103,8 +103,8 @@ class Bbr extends BaseService {
 	 *
 	 * Reads the postcode, the street, the house number and the DAR addresses of the house number, and
 	 * collects the properties that BBR relates to them. Meant for addresses as auction lists write
-	 * them, with an optional floor and door, an optional supplementary town name and an optional
-	 * trailing m.fl.
+	 * them, with an optional floor and door and an optional trailing m.fl., and for DAR's own
+	 * designation of an address, such as matchedAddress, which adds the supplementary town name.
 	 *
 	 * Behavior:
 	 * - selectedBfeNumber is set only when the evidence is decisive: One candidate in total, or one
@@ -1775,8 +1775,8 @@ class Bbr extends BaseService {
 	/**
 	 * Leave the supplementary town name of a house number out of a typed floor and door.
 	 *
-	 * Auction lists write the supplementary town name between the house number and the postcode,
-	 * where parseAuctionAddress() reads a floor and a door.
+	 * DAR's designation of an address, such as matchedAddress, writes the supplementary town name
+	 * just before the postcode, where parseAuctionAddress() reads a floor and a door.
 	 *
 	 * Behavior:
 	 * - Every comma-separated part of the typed text that equals, after normalizeForDistance(), a

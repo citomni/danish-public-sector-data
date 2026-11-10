@@ -110,10 +110,11 @@ if ($resolution['selectedBfeNumber'] !== null) {
 explicitly indicates additional auction properties. The service never invents those additional
 BFE numbers from the primary address.
 
-Auction lists write a supplementary town name between the house number and the postcode, as in
-`Eksempelvej 10, Tofterup, 7200 Grindsted`, where a floor and door would otherwise be read. When
-the typed floor and door select no DAR address, `resolveAddress()` leaves out the parts that DAR
-writes as the house number's supplementary town name and selects the address again;
+DAR's own designation of an address, which `resolveAddress()` returns as `matchedAddress`, writes
+the supplementary town name just before the postcode, as in
+`Eksempelvej 10, 2. tv, Tofterup, 7200 Grindsted`, where a floor and door would otherwise be read.
+When the typed floor and door select no DAR address, `resolveAddress()` leaves out the parts that
+DAR writes as the house number's supplementary town name and selects the address again;
 `parsed.unit` then holds what is left. A part that DAR does not write for the house number is
 still read as a floor and door.
 
