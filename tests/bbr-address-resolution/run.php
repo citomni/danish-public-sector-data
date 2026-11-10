@@ -276,16 +276,18 @@ function page(string $root, array $nodes): array {
  *
  * @param  string|null  $accessBuilding  Key of IDS for the building that DAR names for the house number, or null for none.
  * @param  bool  $floors  True for a house number with two addresses on two floors, false for one address without floor and door.
+ * @param  string|null  $townName  Supplementary town name that DAR writes for the house number, or null for none.
  * @return list<array{root:string,status:int,body:string}>
  */
-function dar(?string $accessBuilding, bool $floors = false): array {
+function dar(?string $accessBuilding, bool $floors = false, ?string $townName = null): array {
+	$town = $townName !== null ? $townName . ', ' : '';
 	$addresses = $floors
 		? [
-			['id_lokalId' => IDS['address'], 'adressebetegnelse' => 'Eksempelvej 10L, st. tv, 7200 Grindsted', 'etagebetegnelse' => 'st', 'doerbetegnelse' => 'tv'],
-			['id_lokalId' => IDS['address-2'], 'adressebetegnelse' => 'Eksempelvej 10L, 1. tv, 7200 Grindsted', 'etagebetegnelse' => '1', 'doerbetegnelse' => 'tv'],
+			['id_lokalId' => IDS['address'], 'adressebetegnelse' => 'Eksempelvej 10L, st. tv, ' . $town . '7200 Grindsted', 'etagebetegnelse' => 'st', 'doerbetegnelse' => 'tv'],
+			['id_lokalId' => IDS['address-2'], 'adressebetegnelse' => 'Eksempelvej 10L, 1. tv, ' . $town . '7200 Grindsted', 'etagebetegnelse' => '1', 'doerbetegnelse' => 'tv'],
 		]
 		: [
-			['id_lokalId' => IDS['address'], 'adressebetegnelse' => 'Eksempelvej 10L, 7200 Grindsted', 'etagebetegnelse' => '', 'doerbetegnelse' => ''],
+			['id_lokalId' => IDS['address'], 'adressebetegnelse' => 'Eksempelvej 10L, ' . $town . '7200 Grindsted', 'etagebetegnelse' => '', 'doerbetegnelse' => ''],
 		];
 
 	return [
@@ -294,7 +296,7 @@ function dar(?string $accessBuilding, bool $floors = false): array {
 		page('DAR_NavngivenVejPostnummer', [['id_lokalId' => IDS['street-postcode'], 'navngivenVej' => IDS['street'], 'postnummer' => IDS['postcode']]]),
 		page('DAR_Husnummer', [[
 			'id_lokalId' => IDS['house'],
-			'adgangsadressebetegnelse' => 'Eksempelvej 10L, 7200 Grindsted',
+			'adgangsadressebetegnelse' => 'Eksempelvej 10L, ' . $town . '7200 Grindsted',
 			'husnummertekst' => '10L',
 			'adgangTilBygning' => $accessBuilding !== null ? IDS[$accessBuilding] : null,
 		]]),
@@ -519,6 +521,68 @@ test('A house number whose own building has a property resolves through it, with
 	check($result['status'] === 'resolved' && $result['selectedBfeNumber'] === 2001, 'Without a selected address the SFE of the building is selected.');
 	check($result['bfeCandidates'] === [candidate(2001, 'sfe', 'own-property', ['ground_sfe'])], 'The SFE is the only candidate.');
 	check($result['warnings'] === ['multiple_addresses_without_unit'], 'The missing floor and door are reported.');
+});
+
+
+// ----------------------------------------------------------------
+// Supplementary town names
+// ----------------------------------------------------------------
+
+test('A supplementary town name after the house number is not taken for a floor and a door', function (): void {
+	script([
+		...dar('own-building', false, 'Tofterup'),
+		page('BBR_Bygning', [building('own-building', 'own-ground')]),
+		page('BBR_Grund', [ground('own-ground', 'own-property')]),
+		page('BBR_BygningEjendomsrelation', []),
+		page('BBR_Enhed', [unit('unit', 'own-building')]),
+		page('BBR_EnhedEjendomsrelation', []),
+		page('BBR_Ejendomsrelation', [property('own-property', 2001, '1')]),
+	]);
+	$result = bbr()->resolveAddress('Eksempelvej 10L, Tofterup, 7200 Grindsted');
+
+	check($result['matchedAddress'] === 'Eksempelvej 10L, Tofterup, 7200 Grindsted', 'The only address of the house number is selected.');
+	check($result['parsed']['unit'] === null, 'No floor and door are left.');
+	check($result['status'] === 'resolved' && $result['selectedBfeNumber'] === 2001 && $result['warnings'] === [], 'The SFE is selected.');
+	check(\str_contains(queriesOf('BBR_Enhed')[0], 'where: { adresseIdentificerer: { eq: "' . IDS['address'] . '" } }'), 'The units are asked for by the selected address.');
+	check(transport()->responses === [], 'Every scripted answer is asked for.');
+});
+
+test('A supplementary town name after a floor and a door is left out, so the owner apartment is selected', function (): void {
+	script([
+		...dar('own-building', true, 'Tofterup'),
+		page('BBR_Bygning', [building('own-building', 'own-ground')]),
+		page('BBR_Grund', [ground('own-ground', 'own-property')]),
+		page('BBR_BygningEjendomsrelation', []),
+		page('BBR_Enhed', [unit('unit-2', 'own-building')]),
+		page('BBR_EnhedEjendomsrelation', [['id_lokalId' => IDS['unit-relation-2'], 'enhed' => IDS['unit-2'], 'ejerlejlighed' => IDS['apartment-2']]]),
+		page('BBR_Ejendomsrelation', [property('own-property', 2001, '1'), property('apartment-2', 2102, '3')]),
+	]);
+	$result = bbr()->resolveAddress('Eksempelvej 10L, 1. tv, Tofterup, 7200 Grindsted');
+
+	check($result['matchedAddress'] === 'Eksempelvej 10L, 1. tv, Tofterup, 7200 Grindsted', 'The address of the typed floor and door is selected.');
+	check($result['parsed']['unit'] === ['raw' => '1. tv', 'floor' => '1', 'door' => 'tv'], 'The floor and door are read without the town name.');
+	check($result['status'] === 'resolved' && $result['selectedBfeNumber'] === 2102, 'The owner apartment of the unit at the address is selected.');
+	check($result['bfeCandidates'] === [candidate(2001, 'sfe', 'own-property', ['ground_sfe']), candidate(2102, 'ejerlejlighed', 'apartment-2', ['selected_unit_ejerlejlighed'])], 'The SFE and the owner apartment of the selected unit are candidates.');
+	check(transport()->responses === [], 'Every scripted answer is asked for.');
+});
+
+test('A part that DAR does not write for the house number is still read as a floor and a door', function (): void {
+	script([
+		...dar('own-building', false, 'Tofterup'),
+		page('BBR_Bygning', [building('own-building', 'own-ground')]),
+		page('BBR_Grund', [ground('own-ground', 'own-property')]),
+		page('BBR_BygningEjendomsrelation', []),
+		page('BBR_Enhed', [unit('unit', 'own-building')]),
+		page('BBR_EnhedEjendomsrelation', []),
+		page('BBR_Ejendomsrelation', [property('own-property', 2001, '1')]),
+	]);
+	$result = bbr()->resolveAddress('Eksempelvej 10L, Andeby, 7200 Grindsted');
+
+	check($result['parsed']['unit'] === ['raw' => 'Andeby', 'floor' => 'andeby', 'door' => null], 'The other part stays the typed floor.');
+	check($result['matchedAddress'] === null, 'No address is selected.');
+	check(\str_contains(queriesOf('BBR_Enhed')[0], 'where: { bygning: { in: ["' . IDS['own-building'] . '"] } }'), 'The units are asked for by the buildings of the house number.');
+	check($result['status'] === 'resolved' && $result['selectedBfeNumber'] === 2001, 'The only candidate is still selected.');
+	check(transport()->responses === [], 'Every scripted answer is asked for.');
 });
 
 

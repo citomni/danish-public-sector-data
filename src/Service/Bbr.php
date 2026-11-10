@@ -103,7 +103,8 @@ class Bbr extends BaseService {
 	 *
 	 * Reads the postcode, the street, the house number and the DAR addresses of the house number, and
 	 * collects the properties that BBR relates to them. Meant for addresses as auction lists write
-	 * them, with an optional floor and door and an optional trailing m.fl.
+	 * them, with an optional floor and door, an optional supplementary town name and an optional
+	 * trailing m.fl.
 	 *
 	 * Behavior:
 	 * - selectedBfeNumber is set only when the evidence is decisive: One candidate in total, or one
@@ -122,6 +123,10 @@ class Bbr extends BaseService {
 	 * - A trailing m.fl. or mfl. is removed from lookupInput and sets multiplePropertiesHint. With a
 	 *   selected BFE number, status is then primary_resolved_scope_incomplete: The other properties
 	 *   of the auction are not resolved, and their BFE numbers are never guessed.
+	 * - A supplementary town name after the house number is not taken for a floor and a door: When
+	 *   the typed floor and door select no DAR address, the parts that DAR writes as the
+	 *   supplementary town name of the house number are left out of parsed.unit, and the address
+	 *   is selected again.
 	 * - The street matches exactly within the postcode. Without an exact match, a misspelt name
 	 *   resolves only when one street is clearly the closest, with status fuzzy_unique in
 	 *   streetMatch.
@@ -269,6 +274,18 @@ class Bbr extends BaseService {
 
 		$addresses = self::uniqueById($addresses);
 		$addressSelection = $this->selectAddress($addresses, $parsed['unit']);
+
+		if ($addressSelection['status'] === 'unit_not_unique' && $parsed['unit'] !== null) {
+			$unit = $this->withoutSupplementaryTownName(
+				$parsed['unit'],
+				self::nullableString($houseNumbers[0]['adgangsadressebetegnelse'] ?? null)
+			);
+			if ($unit !== $parsed['unit']) {
+				$parsed['unit'] = $unit;
+				$addressSelection = $this->selectAddress($addresses, $unit);
+			}
+		}
+
 		$candidates = $this->resolveBfeCandidates(
 			$houseNumberId,
 			self::nullableString($houseNumbers[0]['adgangTilBygning'] ?? null),
@@ -1753,6 +1770,58 @@ class Bbr extends BaseService {
 			'status' => $addresses === [] ? 'no_address' : 'multiple_addresses',
 			'selected' => null,
 		];
+	}
+
+	/**
+	 * Leave the supplementary town name of a house number out of a typed floor and door.
+	 *
+	 * Auction lists write the supplementary town name between the house number and the postcode,
+	 * where parseAuctionAddress() reads a floor and a door.
+	 *
+	 * Behavior:
+	 * - Every comma-separated part of the typed text that equals, after normalizeForDistance(), a
+	 *   part of the designation between the house number and the postcode is left out. The rest
+	 *   is read as parseUnit() reads it; null when nothing is left.
+	 * - The unit is returned unchanged when no part is left out.
+	 *
+	 * @param  array{raw:string,floor:?string,door:?string}  $unit  Typed floor and door, as parseUnit() reads them.
+	 * @param  string|null  $designation  DAR adgangsadressebetegnelse of the house number, such as Eksempelvej 10, Tofterup, 7200 Grindsted, or null.
+	 * @return array{raw:string,floor:?string,door:?string}|null
+	 */
+	private function withoutSupplementaryTownName(array $unit, ?string $designation): ?array {
+		// DAR writes the supplementary town name as the parts between the house number and the postcode.
+		$townNames = [];
+		foreach (\array_slice(\explode(',', (string)$designation), 1, -1) as $part) {
+			$name = self::normalizeForDistance($part);
+			if ($name !== '') {
+				$townNames[$name] = true;
+			}
+		}
+
+		if ($townNames === []) {
+			return $unit;
+		}
+
+		$kept = [];
+		$leftOut = false;
+		foreach (\explode(',', $unit['raw']) as $part) {
+			$part = \trim($part);
+			if ($part === '') {
+				continue;
+			}
+
+			if (isset($townNames[self::normalizeForDistance($part)])) {
+				$leftOut = true;
+			} else {
+				$kept[] = $part;
+			}
+		}
+
+		if (!$leftOut) {
+			return $unit;
+		}
+
+		return $kept !== [] ? $this->parseUnit(\implode(', ', $kept)) : null;
 	}
 
 	/**

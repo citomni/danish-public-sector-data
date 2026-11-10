@@ -110,6 +110,13 @@ if ($resolution['selectedBfeNumber'] !== null) {
 explicitly indicates additional auction properties. The service never invents those additional
 BFE numbers from the primary address.
 
+Auction lists write a supplementary town name between the house number and the postcode, as in
+`Eksempelvej 10, Tofterup, 7200 Grindsted`, where a floor and door would otherwise be read. When
+the typed floor and door select no DAR address, `resolveAddress()` leaves out the parts that DAR
+writes as the house number's supplementary town name and selects the address again;
+`parsed.unit` then holds what is left. A part that DAR does not write for the house number is
+still read as a floor and door.
+
 Owner-apartment resolution uses the concrete DAR floor/door address and the corresponding BBR
 unit/property relation. This allows the selected owner apartment to be distinguished from the
 underlying SFE at the same house number.
@@ -184,8 +191,9 @@ php tests/bbr-addresses/run.php
 ```
 
 The property lookup of `resolveAddress()`, through the buildings of the house number and through
-the buildings it gives access to, has a suite of its own with scripted responses, which also
-checks its query documents against the bundled schema:
+the buildings it gives access to, and its reading of a supplementary town name have a suite of
+their own with scripted responses, which also checks the query documents against the bundled
+schema:
 
 ```bash
 php tests/bbr-address-resolution/run.php
