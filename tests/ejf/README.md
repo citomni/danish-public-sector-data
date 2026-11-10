@@ -1,6 +1,6 @@
 # EJF suite
 
-Isolated checks for the `ejf` service, `\CitOmni\DanishPublicSectorData\Service\Ejf`, and the Shared Secret flow of `\CitOmni\DanishPublicSectorData\Support\DatafordelerClient`: the token and query requests, and the ownerships, company ownerships and transfers the service returns, against a scripted transport. No network request is made.
+Isolated checks for the `ejf` service, `\CitOmni\DanishPublicSectorData\Service\Ejf`, and the Shared Secret flow of `\CitOmni\DanishPublicSectorData\Support\DatafordelerClient`: the token and query requests, and the ownerships, company ownerships, transfers, administrations and administration entries the service returns, against a scripted transport. No network request is made.
 
 ## Run
 
@@ -11,12 +11,12 @@ php tests/ejf/run.php
 Expected result:
 
 ```
-60 passed, 0 failed
+86 passed, 0 failed
 ```
 
 `PASS` lines go to stdout, `FAIL` lines to stderr. The last line holds the totals, and the exit code is 1 when a check fails.
 
-One case needs `vendor/` from `composer install` in the package root: the transport failure of the token request throws the real `\CitOmni\Infrastructure\Exception\CurlException`. Without `vendor/`, that case fails with a message that says so, and the suite ends with `59 passed, 1 failed`.
+One case needs `vendor/` from `composer install` in the package root: the transport failure of the token request throws the real `\CitOmni\Infrastructure\Exception\CurlException`. Without `vendor/`, that case fails with a message that says so, and the suite ends with `85 passed, 1 failed`.
 
 ## How it works
 
@@ -24,7 +24,7 @@ The real service and `DatafordelerClient` run on an app double with the `datafor
 
 The client keeps an access token for the process, per token endpoint and client id. A case that needs a new token therefore first takes a client id of its own, and a case that does not test the token flow scripts a token answer in front of its own answers.
 
-The curl double keeps every query document sent. The last case checks them all against the bundled `resources/bbr/FLEX_CURRENT_V003.schema.graphql` with `\CitOmni\DanishPublicSectorData\Tests\Support\GraphqlSchema`, and checks that the service queries only the roots `EJFCustom_EjerskabBegraenset` and `EJF_Ejerskifte`. It therefore covers the documents of the cases before it.
+The curl double keeps every query document sent. The last case checks them all against the bundled `resources/bbr/FLEX_CURRENT_V003.schema.graphql` with `\CitOmni\DanishPublicSectorData\Tests\Support\GraphqlSchema`, checks that the service queries only the roots `EJFCustom_EjerskabBegraenset`, `EJFCustom_PersonEllerVirksomhedsadminiBegraenset` and `EJF_Ejerskifte`, and that the reference joins it follows are only those of the Handelsoplysninger and of `EJFCustom_AlternativAdresseBegraenset`; the schema also offers joins to entities that only public authorities get. It therefore covers the documents of the cases before it.
 
 ## Checks
 
@@ -89,6 +89,32 @@ The curl double keeps every query document sent. The last case checks them all a
 | getCompanyOwnerships() takes the CVR number as a string, and a company without ownerships gives no entries | A string CVR number; an empty result |
 | An invalid CVR number is rejected without a request | Seven and nine digits, zero, negative, a leading zero, padded, a letter, an empty string |
 | An ownership of another owner in the answer of a company lookup is rejected | Another CVR number and a person owner as `InvalidResponseException` |
-| Every query document sent fits the bundled flexibleCurrent v3 schema and queries only the ownership and transfer roots | Every document the suite sent; the two roots |
+| getImportedAdministrationEntries() filters on the import batches in one object, follows the pages of 500 and lists the entries by batch, then object id | The `gte` and `lt` filter in one object, pages of 500, cursor paging with one effect time, the order, an entry without an object id last, a repeated row |
+| An entry keeps the import batch, the registration time in UTC, the Danish effect date and the administered party | The complete record of an entry; a registration time with an offset and microseconds; the placeholders of the year 1 and of 1800; a company, another party and no party administered; no administrator in an entry |
+| An empty import batch range or one outside 0-2147483647 is rejected without a request | A negative start, an empty and a reversed range, an end above the GraphQL Int |
+| getRegisteredAdministrationEntries() sends the period in UTC to the second in one object, and a period shorter than a second is rejected without a request | Danish times as UTC, cut to the second; an empty, a reversed and a sub-second period |
+| getAdministrationEntries() and getAdministrations() send the object ids in batches of 100, key the answers by object id and leave out ids without an administration | Batches, first-occurrence order, ids without an administration, a string id, the administrator selection of a full lookup only |
+| No object ids give no entries, and invalid object ids are rejected, both without a request | Empty lists; zero, a leading zero, negative, decimal, padded, too long, `null` and boolean ids |
+| An administration of an id that was not requested, or without an object id, in the answer of a lookup by id is rejected | `InvalidResponseException` |
+| A person administrator keeps its CPR data in the shape of an owner person | The person of an administration |
+| A company, a production unit, an owner without CPR or CVR number and an administration without an administrator get their administrator type and their own data | The order of the types, a company that names a production unit, the owner information with its current alternative address, a rolled-back administration without an administrator |
+| Owner information without an alternative address, and an alternative address that is not current, keep what EJF holds | Owner information without its id, a former alternative address |
+| An administration with a missing id is rejected | `id_lokalId` null |
+| An administration with an object id as a string is rejected | `objectid` "7001" |
+| An administration with an import batch as a string is rejected | `datafordelerRegisterImportSequenceNumber` "454989" |
+| An administration with a missing status is rejected | `status` null |
+| An administration with a registration time without an offset is rejected | `registreringFra` 2026-11-05T14:09:59 |
+| An administration with a missing effect start is rejected | `virkningFra` null |
+| An administration with an administered person that is not an object is rejected | `administreretPersonBegraenset` "doed" |
+| An administration with an administered person without a status date is rejected | `statusdato` null |
+| An administration with an administered person whose birth date does not exist is rejected | `foedselsdato` 1941-02-30 |
+| An administration with an administered CVR number that is not a number is rejected | `administreretVirksomCVRNr` "40477055" |
+| An administration with an administrator CVR number that is not a number is rejected | `virksomhedCVRNr` "35209352" |
+| An administration with an administrator P-number below 1 is rejected | `produktionsenhedPNr` 0 |
+| An administration with an administrator person without a status date is rejected | `statusdato` null on `personBegraenset` |
+| An administration with owner information that is not an object is rejected | `personEllerVirksomhedsadministratorErPersonEllerVirksomhedsoplysninger` "Boet" |
+| An administration with an alternative address that is not an object is rejected | The alternative address as a string |
+| An administration with an alternative address without a status is rejected | `status` null on the alternative address |
+| Every query document sent fits the bundled flexibleCurrent v3 schema and queries only the ownership, transfer and administration roots and joins of the private-actor entities | Every document the suite sent; the three roots; the two reference joins |
 
 `php tests/run.php` runs every suite of the package.

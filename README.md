@@ -12,7 +12,7 @@ Repository: https://github.com/citomni/danish-public-sector-data
 It exposes small, normalized CitOmni services while keeping upstream API protocols,
 authentication details, and source-specific data models inside the provider.
 
-The provider currently exposes normalized CVR, BBR, EJF ownership, VAT-registration, and soil-contamination capabilities backed by the relevant Danish public-sector sources.
+The provider currently exposes normalized CVR, BBR, EJF ownership and administrator, VAT-registration, and soil-contamination capabilities backed by the relevant Danish public-sector sources.
 
 ## Requirements
 
@@ -471,9 +471,13 @@ The provider exposes `ejf` for Ejerfortegnelsen (EJF), the Danish register of wh
 real property, through Datafordeler `flexibleCurrent/v3`. EJF is access-restricted: the
 service authenticates with the Shared Secret (see [Datafordeler credentials](#datafordeler-credentials)).
 It queries only `EJFCustom_EjerskabBegraenset` with its `ejendePersonBegraenset` and
-`oplysningerEjesAfEjerskab` joins, and `EJF_Ejerskifte` with its Handelsoplysninger join.
+`oplysningerEjesAfEjerskab` joins, `EJF_Ejerskifte` with its Handelsoplysninger join, and
+`EJFCustom_PersonEllerVirksomhedsadminiBegraenset` with its `administreretPersonBegraenset`,
+`personBegraenset` and `personEllerVirksomhedsadministratorErPersonEllerVirksomhedsoplysninger`
+joins and the `EJFCustom_AlternativAdresseBegraenset` of that owner information.
 Datafordeler refuses a query as a whole when it touches an entity outside the host app's
-access, so these are the entities the access must cover.
+access, so these are the entities the access must cover. The administrations need only the
+methods under [Administrators](#administrators).
 
 ```php
 $ownerships = $this->app->ejf->getOwnerships([4268969]);
@@ -504,8 +508,8 @@ stopped owning the property, not the day it started.
   oldest first by `takeoverDate`. Rolled-back registrations (status `tilbagerullet`) are
   left out.
 - EJF stores calendar dates as instants of Danish midnight. The service returns them as
-  Danish dates, `YYYY-MM-DD`, and EJF's placeholders for an unknown date, 1 January 1800
-  and 1 January 1970, as `null`.
+  Danish dates, `YYYY-MM-DD`, and EJF's placeholders for an unknown date, the start of the
+  year 1, 1 January 1800 and 1 January 1970, as `null`.
 - EJF withholds the name and the address of a person with name and address protection, so
   `name`, `address` and `addressingName` are `null` for that person; `protections` lists the
   kinds of protection, such as `navne_og_adresse`.
@@ -519,10 +523,47 @@ stopped owning the property, not the day it started.
 - The conversion from the former ownership register left some trades twice, with the same
   takeover date, method and price. The lists keep both.
 
+### Administrators
+
+An administration (`CustomPersonEllerVirksomhedsadminiBegraenset`) names who administers a
+person or a company, such as the estate of a deceased person. EJF offers no filter on the
+administered person, so a host app reads the administrations by the EJF import batches that
+brought them, or by registration time, and then the administrators of those it needs:
+
+```php
+$entries = $this->app->ejf->getImportedAdministrationEntries(454989, 456989);
+$entries = $this->app->ejf->getRegisteredAdministrationEntries(new \DateTimeImmutable('2026-11-01T00:00:00Z'), new \DateTimeImmutable('2026-11-08T00:00:00Z'));
+$entries = $this->app->ejf->getAdministrationEntries([627801]);
+$administrations = $this->app->ejf->getAdministrations([627801]);
+```
+
+- An entry is an administration without its administrator: its id, object id, import batch,
+  status, registration time, effect date, business event and process, and the administered
+  party, with the id, CPR status, status date and birth date of a person. For a person with
+  status `doed`, the status date is the date of death.
+- `getImportedAdministrationEntries()` lists every administration whose current registration
+  came with an import batch from the first number up to but not including the second, new or
+  changed. EJF numbers its import batches (`datafordelerRegisterImportSequenceNumber`) in one
+  series across its entities, so a host app that keeps the newest batch it has read can read
+  the changes since. The list comes oldest batch first, then by object id.
+- `getRegisteredAdministrationEntries()` lists the administrations whose current registration
+  was made in a period, to the second, in the same order; it finds the batches of a period.
+- `getAdministrationEntries()` and `getAdministrations()` look up administrations by object
+  id, keyed by object id in the order the ids first occur. An id without an administration has
+  no entry. `getAdministrations()` adds the administrator.
+- `administeredType` and `administratorType` are `EjfPartyType` values
+  (`CitOmni\DanishPublicSectorData\Enum`): `person`, `company`, `production_unit` (the
+  administrator only), `other` (a party without CPR or CVR number) or `unknown`.
+- `current` is true for status `gældende`. Ended administrations (`historisk`) and
+  rolled-back registrations (`tilbagerullet`) are returned with their status.
+- Datafordeler pages a range in object id order, not in batch order, so a range is read in
+  full only when every page of it has been read.
+
 ### Requests
 
-The service sends the numbers 100 per request and asks for pages of 100 rows. Every
-request of one call uses the same effect time: the time of the call. The first request of a
+The service sends the numbers and object ids 100 per request and asks for pages of 100 rows,
+or of 500 entries for a range of administrations. Every request of one call uses the same
+effect time: the time of the call. The first request of a
 process with a Shared Secret is preceded by a token request.
 
 | Call | Requests |
@@ -530,6 +571,8 @@ process with a Shared Secret is preceded by a token request.
 | `getOwnerships()` | Per 100 distinct numbers: 1 per started 100 ownerships (at least 1) |
 | `getCompanyOwnerships()` | 1 per started 100 ownerships of the company (at least 1) |
 | `getTransfers()` | Per 100 distinct numbers: 1 per started 100 transfers (at least 1) |
+| `getImportedAdministrationEntries()`, `getRegisteredAdministrationEntries()` | 1 per started 500 entries (at least 1) |
+| `getAdministrationEntries()`, `getAdministrations()` | 1 per 100 distinct object ids |
 
 ### Result shapes
 
@@ -632,6 +675,57 @@ Transfer:
   `movablesPrice` the løsøresum, in `currency`; `disposalDate` is the afståelsesdato.
   `trade` is `null` when EJF has no trade information for the transfer.
 
+Administration:
+
+```php
+[
+	'id' => '0f3c...',
+	'objectId' => 627801,
+	'importSequence' => 454989,
+	'status' => 'gældende',
+	'current' => true,
+	'registeredAt' => '2026-11-05T14:09:59Z',
+	'validFrom' => '2026-10-30',
+	'businessEvent' => 'Person død',
+	'businessProcess' => 'Hændelse fra CPR',
+	'administeredType' => 'person',
+	'administeredPerson' => [
+		'id' => '7d2a...',
+		'status' => 'doed',
+		'statusDate' => '2026-10-30',
+		'birthDate' => '1941-03-09',
+	],
+	'administeredCvr' => null,
+	'administeredOtherId' => null,
+	'administratorType' => 'other',
+	'administratorPerson' => null,
+	'administratorCvr' => null,
+	'administratorPNumber' => null,
+	'administratorOtherId' => '41b8...',
+	'administratorOther' => [
+		'name' => 'Example Heir',
+		'addressLines' => ['Example Street 2', '7400 Herning'],
+		'countryCode' => '999',
+		'alternativeAddress' => [
+			'status' => 'gældende',
+			'current' => true,
+			'lines' => ['c/o Example Law', 'Example Square 1', '7400 Herning'],
+			'countryCode' => '999',
+		],
+	],
+]
+```
+
+- An entry has the keys up to `administeredOtherId`.
+- `registeredAt` is the registration time (registreringFra) in UTC, to the second.
+  `validFrom` is the day the administration took effect; for an estate it is usually the date
+  of death, but not always.
+- `administratorPerson` has the shape of the person of an ownership. `administratorCvr`,
+  `administratorPNumber` and `administratorOtherId` are returned whatever the type, so a
+  company that names a production unit keeps both numbers.
+- `alternativeAddress` is the address for post to an administrator without CPR or CVR number;
+  `null` when EJF names none.
+
 The local suite checks the Shared Secret flow, the requests, batching, pagination and
 normalization against scripted responses, and every query document against the bundled
 flexibleCurrent v3 schema, without network requests:
@@ -682,13 +776,13 @@ The provider keeps the boundaries intentionally small:
 - `Service\Bbr` resolves DAR addresses and returns normalized BBR property data.
 - `Service\SoilContamination` resolves physical Matriklen parcels and returns normalized DKjord soil-contamination data.
 - `Service\Cvr` is the public CVR capability and owns CVR-specific queries and normalization.
-- `Service\Ejf` returns normalized ownerships and transfers from Ejerfortegnelsen.
+- `Service\Ejf` returns normalized ownerships, transfers and administrations from Ejerfortegnelsen.
 - `Service\VatRegistration` is the public VAT-registration status capability.
 - `Support\DatafordelerClient` owns Datafordeler authentication with the API key or the Shared Secret and its access tokens, GraphQL transport, response validation, and safe exception translation.
 - `Support\DkJordWfsClient` isolates anonymous DKjord WFS transport and GeoJSON response validation.
 - `Support\SkatVatWebClient` isolates the temporary public SKAT web-flow transport details.
 - `Exception` contains transport-agnostic integration failure semantics.
-- `Enum` holds vocabularies that host apps store, such as `SoilContaminationStatus` and `EjfOwnerType`, and the choice of Datafordeler credentials, `DatafordelerAuthentication`.
+- `Enum` holds vocabularies that host apps store, such as `SoilContaminationStatus`, `EjfOwnerType` and `EjfPartyType`, and the choice of Datafordeler credentials, `DatafordelerAuthentication`.
 - No SQL, HTTP controller behavior, or CLI output belongs in these services.
 
 New public-sector sources should be added only when there is a concrete consumer.

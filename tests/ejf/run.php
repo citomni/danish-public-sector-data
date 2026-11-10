@@ -26,9 +26,10 @@ use CitOmni\Infrastructure\Exception\CurlException;
 
 /*
  * Isolated suite for the ejf service and the Shared Secret flow of DatafordelerClient: The token
- * and query requests, and the ownerships, company ownerships and transfers the service returns,
- * against a scripted transport. No network request is made. Every query document that is sent is
- * also checked against the bundled flexibleCurrent v3 schema.
+ * and query requests, and the ownerships, company ownerships, transfers, administrations and
+ * administration entries the service returns, against a scripted transport. No network request
+ * is made. Every query document that is sent is also checked against the bundled flexibleCurrent
+ * v3 schema.
  *
  * The case of a failed token transfer throws the CurlException of citomni/infrastructure, so it
  * needs vendor/: Run "composer install" in the package root first.
@@ -597,6 +598,127 @@ function transfersOfEveryKind(): array {
 }
 
 
+/**
+ * Build an answer with one page of administrations.
+ *
+ * @param  list<array<string,mixed>>  $nodes
+ * @param  string|null  $cursor  Cursor of a next page, or null for the last page.
+ * @return array{status:int,body:string}
+ */
+function administrationPage(array $nodes, ?string $cursor = null): array {
+	return page('EJFCustom_PersonEllerVirksomhedsadminiBegraenset', $nodes, $cursor);
+}
+
+
+/**
+ * Build the administered person of an administration: A person who died on 22 July 2026.
+ *
+ * @param  array<string,mixed>  $values  Values that replace the defaults.
+ * @return array<string,mixed>
+ */
+function administeredPerson(array $values = []): array {
+	return \array_replace([
+		'id' => 'deceased-1',
+		'status' => 'doed',
+		'statusdato' => '2026-07-22',
+		'foedselsdato' => '1941-03-09',
+	], $values);
+}
+
+
+/**
+ * Build owner information of an administrator without CPR or CVR number, with a current alternative address.
+ *
+ * @param  array<string,mixed>  $values  Values that replace the defaults.
+ * @return array<string,mixed>
+ */
+function administratorOther(array $values = []): array {
+	return \array_replace([
+		'navn' => ' Example Heir ',
+		'adresselinje1' => 'Example Street 2',
+		'adresselinje2' => null,
+		'adresselinje3' => '7400 Herning',
+		'adresselinje4' => null,
+		'adresselinje5' => null,
+		'adresselinje6' => null,
+		'adresselinje7' => null,
+		'adresselinje8' => null,
+		'adresselinje9' => null,
+		'adresselinje10' => null,
+		'landeKodeNumerisk' => '999',
+		'alternativAdresseLokalId_23_AlternativAdresseBegraenset_id_lokalId_ref' => [
+			'status' => 'gældende',
+			'adresselinje1' => 'c/o Example Law',
+			'adresselinje2' => 'Example Square 1',
+			'adresselinje3' => '7400 Herning',
+			'adresselinje4' => '',
+			'adresselinje5' => null,
+			'adresselinje6' => null,
+			'adresselinje7' => null,
+			'adresselinje8' => null,
+			'adresselinje9' => null,
+			'adresselinje10' => null,
+			'landeKodeNumerisk' => '999',
+		],
+	], $values);
+}
+
+
+/**
+ * Build a current administration of the estate of a deceased person, without an administrator.
+ *
+ * @param  int|null  $objectId
+ * @param  string  $id
+ * @param  array<string,mixed>  $values  Values that replace the defaults.
+ * @return array<string,mixed>
+ */
+function administration(?int $objectId, string $id, array $values = []): array {
+	return \array_replace([
+		'id_lokalId' => $id,
+		'objectid' => $objectId,
+		'datafordelerRegisterImportSequenceNumber' => 454989,
+		'status' => 'gældende',
+		'registreringFra' => '2026-11-05T14:09:59.000000Z',
+		'virkningFra' => '2026-07-21T22:00:00.000000Z',
+		'forretningshaendelse' => 'Person død',
+		'forretningsproces' => 'Hændelse fra CPR',
+		'administreretVirksomCVRNr' => null,
+		'personVirksomOplLokalId' => null,
+		'administreretPersonBegraenset' => administeredPerson(),
+		'virksomhedCVRNr' => null,
+		'produktionsenhedPNr' => null,
+		'personVirksomhedOplysLokalId' => null,
+		'personEllerVirksomhedsadministratorErPersonEllerVirksomhedsoplysninger' => null,
+		'personBegraenset' => null,
+	], $values);
+}
+
+
+/**
+ * Look up the administrations 7001-7005, which have an administrator of every kind.
+ *
+ * The administrations: 7001 a person; 7002 a company that also names a production unit; 7003 a
+ * production unit; 7004 an owner without CPR or CVR number with its alternative address; 7005
+ * without an administrator.
+ *
+ * @return array<int,array<string,mixed>>  Administrations keyed by object id.
+ */
+function administrationsOfEveryKind(): array {
+	scriptWithToken([administrationPage([
+		administration(7001, 'adm-person', ['personBegraenset' => person()]),
+		administration(7002, 'adm-company', ['virksomhedCVRNr' => 35209352, 'produktionsenhedPNr' => 1012345678]),
+		administration(7003, 'adm-unit', ['produktionsenhedPNr' => 1012345679]),
+		administration(7004, 'adm-other', [
+			'personVirksomhedOplysLokalId' => 'pv-9',
+			'personEllerVirksomhedsadministratorErPersonEllerVirksomhedsoplysninger' => administratorOther(),
+		]),
+		administration(7005, 'adm-none', ['status' => 'tilbagerullet']),
+	])]);
+
+	return ejf()->getAdministrations([7001, 7002, 7003, 7004, 7005]);
+}
+
+
 // ----------------------------------------------------------------
 // Shared Secret
 // ----------------------------------------------------------------
@@ -1055,24 +1177,251 @@ test('An ownership of another owner in the answer of a company lookup is rejecte
 
 
 // ----------------------------------------------------------------
+// Administrations
+// ----------------------------------------------------------------
+
+test('getImportedAdministrationEntries() filters on the import batches in one object, follows the pages of 500 and lists the entries by batch, then object id', function (): void {
+	scriptWithToken([
+		administrationPage([
+			administration(9003, 'adm-c', ['datafordelerRegisterImportSequenceNumber' => 455100]),
+			administration(9001, 'adm-a', ['datafordelerRegisterImportSequenceNumber' => 455200]),
+		], 'cursor-a'),
+		administrationPage([
+			administration(9002, 'adm-b', ['datafordelerRegisterImportSequenceNumber' => 455100]),
+			administration(null, 'adm-d', ['datafordelerRegisterImportSequenceNumber' => 455100]),
+			administration(9003, 'adm-c', ['datafordelerRegisterImportSequenceNumber' => 455100, 'status' => 'historisk']),
+		]),
+	]);
+	$entries = ejf()->getImportedAdministrationEntries(454989, 456989);
+	$queries = \array_map(queryOf(...), requestsTo(GRAPHQL_URL));
+
+	check(\count($queries) === 2 && \str_contains($queries[0], 'where: { datafordelerRegisterImportSequenceNumber: { gte: 454989, lt: 456989 } }'), 'The query filters on the import batches with gte and lt in one object.');
+	check(\str_contains($queries[0], "first: 500\n") && \str_contains($queries[1], 'after: "cursor-a"') && effectTime($queries[0]) === effectTime($queries[1]), 'Pages of 500 follow the cursor with one effect time.');
+	check(\array_column($entries, 'id') === ['adm-b', 'adm-c', 'adm-d', 'adm-a'], 'Entries come by batch, then object id, those without one last.');
+	check($entries[1]['current'] === true, 'A registration repeated on a later page is kept once, as it came first.');
+});
+
+test('An entry keeps the import batch, the registration time in UTC, the Danish effect date and the administered party', function (): void {
+	scriptWithToken([administrationPage([
+		administration(9101, 'adm-person', [
+			'status' => 'historisk',
+			'registreringFra' => '2026-11-05T15:09:59.250000+01:00',
+		]),
+		administration(9102, 'adm-company', ['administreretPersonBegraenset' => null, 'administreretVirksomCVRNr' => 40477055, 'virkningFra' => '0001-01-01T00:00:00.000000Z']),
+		administration(9103, 'adm-other', ['administreretPersonBegraenset' => null, 'personVirksomOplLokalId' => 'pv-3', 'virkningFra' => '1799-12-31T23:00:00Z']),
+		administration(9104, 'adm-unknown', ['administreretPersonBegraenset' => null, 'forretningshaendelse' => ' ']),
+	])]);
+	$entries = \array_column(ejf()->getImportedAdministrationEntries(454000, 455000), null, 'id');
+
+	check($entries['adm-person'] === [
+		'id' => 'adm-person',
+		'objectId' => 9101,
+		'importSequence' => 454989,
+		'status' => 'historisk',
+		'current' => false,
+		'registeredAt' => '2026-11-05T14:09:59Z',
+		'validFrom' => '2026-07-22',
+		'businessEvent' => 'Person død',
+		'businessProcess' => 'Hændelse fra CPR',
+		'administeredType' => 'person',
+		'administeredPerson' => ['id' => 'deceased-1', 'status' => 'doed', 'statusDate' => '2026-07-22', 'birthDate' => '1941-03-09'],
+		'administeredCvr' => null,
+		'administeredOtherId' => null,
+	], 'An entry keeps its batch, its registration time in UTC to the second, its Danish effect date and the dates of the administered person.');
+	check($entries['adm-company']['administeredType'] === 'company' && $entries['adm-company']['administeredCvr'] === '40477055' && $entries['adm-company']['validFrom'] === null, 'A company is administered by CVR number, and the effect start of the year 1 is a placeholder.');
+	check($entries['adm-other']['administeredType'] === 'other' && $entries['adm-other']['administeredOtherId'] === 'pv-3' && $entries['adm-other']['validFrom'] === null, 'A party without CPR or CVR number is other, and the 1800 placeholder becomes null.');
+	check($entries['adm-unknown']['administeredType'] === 'unknown' && $entries['adm-unknown']['businessEvent'] === null && !\array_key_exists('administratorType', $entries['adm-unknown']), 'Without an administered party the entry is unknown, a blank text is null, and an entry has no administrator.');
+});
+
+test('An empty import batch range or one outside 0-2147483647 is rejected without a request', function (): void {
+	script([]);
+
+	foreach ([[-1, 5], [5, 5], [5, 4], [0, 2147483648]] as [$from, $to]) {
+		throws(\InvalidArgumentException::class, fn() => ejf()->getImportedAdministrationEntries($from, $to));
+	}
+
+	check(transport()->requests === [], 'Invalid ranges send no request.');
+});
+
+test('getRegisteredAdministrationEntries() sends the period in UTC to the second in one object, and a period shorter than a second is rejected without a request', function (): void {
+	$copenhagen = new \DateTimeZone('Europe/Copenhagen');
+	scriptWithToken([administrationPage([administration(9201, 'adm-r')])]);
+	$entries = ejf()->getRegisteredAdministrationEntries(new \DateTimeImmutable('2026-11-01 00:00:00', $copenhagen), new \DateTimeImmutable('2026-11-08 00:00:00.75', $copenhagen));
+
+	check(
+		\str_contains(queryOf(requestsTo(GRAPHQL_URL)[0]), 'where: { registreringFra: { gte: "2026-10-31T23:00:00Z", lt: "2026-11-07T23:00:00Z" } }'),
+		'The period goes out in UTC to the second, with gte and lt in one object.'
+	);
+	check(\array_column($entries, 'id') === ['adm-r'], 'The entries of the period are listed.');
+
+	script([]);
+	$start = new \DateTimeImmutable('2026-11-01 00:00:00', $copenhagen);
+	throws(\InvalidArgumentException::class, fn() => ejf()->getRegisteredAdministrationEntries($start, $start));
+	throws(\InvalidArgumentException::class, fn() => ejf()->getRegisteredAdministrationEntries($start, $start->modify('-1 day')));
+	throws(\InvalidArgumentException::class, fn() => ejf()->getRegisteredAdministrationEntries($start, new \DateTimeImmutable('2026-11-01 00:00:00.9', $copenhagen)));
+	check(transport()->requests === [], 'A period shorter than a second sends no request.');
+});
+
+test('getAdministrationEntries() and getAdministrations() send the object ids in batches of 100, key the answers by object id and leave out ids without an administration', function (): void {
+	$ids = \range(8001, 8150);
+	scriptWithToken([
+		administrationPage([administration(8100, 'adm-100'), administration(8001, 'adm-1')]),
+		administrationPage([administration(8150, 'adm-150')]),
+	]);
+	$entries = ejf()->getAdministrationEntries(\array_merge($ids, ['8001', 8002]));
+	$queries = \array_map(queryOf(...), requestsTo(GRAPHQL_URL));
+
+	check(\count($queries) === 2 && \str_contains($queries[0], 'where: { objectid: { in: [' . \implode(', ', \range(8001, 8100)) . '] } }') && \str_contains($queries[1], 'objectid: { in: [' . \implode(', ', \range(8101, 8150)) . '] }'), '150 distinct ids go out in batches of 100 and 50, each id once.');
+	check(\str_contains($queries[0], "first: 100\n") && !\str_contains($queries[0], 'personBegraenset {'), 'A batch asks for 100 rows, and an entry lookup selects no administrator.');
+	check(\array_keys($entries) === [8001, 8100, 8150] && $entries[8100]['id'] === 'adm-100', 'Entries are keyed by object id in the order the ids first occur, and ids without an administration have none.');
+
+	scriptWithToken([administrationPage([administration(8002, 'adm-2')])]);
+	$administrations = ejf()->getAdministrations(['8002', 8003]);
+	$query = queryOf(requestsTo(GRAPHQL_URL)[0]);
+
+	check(\array_keys($administrations) === [8002] && $administrations[8002]['administratorType'] === 'unknown', 'A string id is looked up, and the administration has its administrator fields.');
+	check(\str_contains($query, 'personBegraenset {') && \str_contains($query, 'alternativAdresseLokalId_23_AlternativAdresseBegraenset_id_lokalId_ref {'), 'An administration lookup selects the administrator with its alternative address.');
+});
+
+test('No object ids give no entries, and invalid object ids are rejected, both without a request', function (): void {
+	script([]);
+	check(ejf()->getAdministrations([]) === [] && ejf()->getAdministrationEntries([]) === [], 'No ids give no entries.');
+
+	foreach (['0', '012', -1, 0, '1.5', 1.5, 'abc', ' 12', '99999999999999999999', null, true] as $invalid) {
+		throws(\InvalidArgumentException::class, fn() => ejf()->getAdministrations([8001, $invalid]));
+		throws(\InvalidArgumentException::class, fn() => ejf()->getAdministrationEntries([$invalid]));
+	}
+
+	check(transport()->requests === [], 'No ids and invalid ids send no request.');
+});
+
+test('An administration of an id that was not requested, or without an object id, in the answer of a lookup by id is rejected', function (): void {
+	scriptWithToken([administrationPage([administration(8999, 'adm-x')])]);
+	throws(InvalidResponseException::class, fn() => ejf()->getAdministrations([8001]));
+
+	scriptWithToken([administrationPage([administration(null, 'adm-y')])]);
+	throws(InvalidResponseException::class, fn() => ejf()->getAdministrationEntries([8001]));
+});
+
+test('A person administrator keeps its CPR data in the shape of an owner person', function (): void {
+	$person = administrationsOfEveryKind()[7001];
+
+	check($person['administratorType'] === 'person' && $person['administratorCvr'] === null && $person['administratorOther'] === null, 'A person administers.');
+	check($person['administratorPerson'] === [
+		'id' => 'person-1',
+		'status' => 'bopael_i_danmark',
+		'statusDate' => '2015-03-01',
+		'statusDateUncertain' => false,
+		'birthDate' => '1950-06-15',
+		'birthDateUncertain' => false,
+		'name' => 'Example Owner',
+		'protections' => ['lokal_vejviser', 'markedsfoering'],
+		'address' => [
+			'line' => 'Eksempelvej 12, 2. tv',
+			'street' => 'Eksempelvej',
+			'houseNumber' => '12',
+			'floor' => '02',
+			'door' => 'tv',
+			'building' => null,
+			'city' => null,
+			'postalCode' => '7400',
+			'postalDistrict' => 'Herning',
+			'municipalityCode' => '0657',
+			'municipalityName' => 'Herning',
+			'roadCode' => '1234',
+			'formatted' => 'Eksempelvej 12, 2. tv, 7400 Herning',
+		],
+		'addressingName' => 'Example Owner',
+		'foreignAddress' => null,
+	], 'The person keeps its CPR data in the shape of an owner person.');
+});
+
+test('A company, a production unit, an owner without CPR or CVR number and an administration without an administrator get their administrator type and their own data', function (): void {
+	$rows = administrationsOfEveryKind();
+
+	check(
+		$rows[7002]['administratorType'] === 'company' && $rows[7002]['administratorCvr'] === '35209352' && $rows[7002]['administratorPNumber'] === '1012345678',
+		'A CVR number makes a company, and the P-number it also names is kept.'
+	);
+	check($rows[7003]['administratorType'] === 'production_unit' && $rows[7003]['administratorPNumber'] === '1012345679' && $rows[7003]['administratorCvr'] === null, 'A P-number alone makes a production unit.');
+	check($rows[7004]['administratorType'] === 'other' && $rows[7004]['administratorOtherId'] === 'pv-9' && $rows[7004]['administratorOther'] === [
+		'name' => 'Example Heir',
+		'addressLines' => ['Example Street 2', '7400 Herning'],
+		'countryCode' => '999',
+		'alternativeAddress' => ['status' => 'gældende', 'current' => true, 'lines' => ['c/o Example Law', 'Example Square 1', '7400 Herning'], 'countryCode' => '999'],
+	], 'An owner without CPR or CVR number keeps its name, its address lines and its alternative address.');
+	check($rows[7005]['administratorType'] === 'unknown' && $rows[7005]['current'] === false && $rows[7005]['status'] === 'tilbagerullet', 'Without an administrator the administration is unknown, and a rolled-back registration is returned with its status.');
+});
+
+test('Owner information without an alternative address, and an alternative address that is not current, keep what EJF holds', function (): void {
+	scriptWithToken([administrationPage([
+		administration(7101, 'adm-plain', ['personEllerVirksomhedsadministratorErPersonEllerVirksomhedsoplysninger' => administratorOther(['alternativAdresseLokalId_23_AlternativAdresseBegraenset_id_lokalId_ref' => null])]),
+		administration(7102, 'adm-former', ['personEllerVirksomhedsadministratorErPersonEllerVirksomhedsoplysninger' => administratorOther(['alternativAdresseLokalId_23_AlternativAdresseBegraenset_id_lokalId_ref' => \array_replace(administratorOther()['alternativAdresseLokalId_23_AlternativAdresseBegraenset_id_lokalId_ref'], ['status' => 'historisk'])])]),
+	])]);
+	$rows = ejf()->getAdministrations([7101, 7102]);
+
+	check($rows[7101]['administratorType'] === 'other' && $rows[7101]['administratorOtherId'] === null && $rows[7101]['administratorOther']['alternativeAddress'] === null, 'Owner information that EJF joins makes an other administrator, also without its id, and no alternative address is null.');
+	check($rows[7102]['administratorOther']['alternativeAddress']['current'] === false && $rows[7102]['administratorOther']['alternativeAddress']['status'] === 'historisk', 'An alternative address that is not current is returned with its status.');
+});
+
+// One case per row: Each row replaces values of a valid administration, and its key says what
+// makes the administration invalid.
+foreach ([
+	'a missing id' => ['id_lokalId' => null],
+	'an object id as a string' => ['objectid' => '7001'],
+	'an import batch as a string' => ['datafordelerRegisterImportSequenceNumber' => '454989'],
+	'a missing status' => ['status' => null],
+	'a registration time without an offset' => ['registreringFra' => '2026-11-05T14:09:59'],
+	'a missing effect start' => ['virkningFra' => null],
+	'an administered person that is not an object' => ['administreretPersonBegraenset' => 'doed'],
+	'an administered person without a status date' => ['administreretPersonBegraenset' => administeredPerson(['statusdato' => null])],
+	'an administered person whose birth date does not exist' => ['administreretPersonBegraenset' => administeredPerson(['foedselsdato' => '1941-02-30'])],
+	'an administered CVR number that is not a number' => ['administreretVirksomCVRNr' => '40477055'],
+	'an administrator CVR number that is not a number' => ['virksomhedCVRNr' => '35209352'],
+	'an administrator P-number below 1' => ['produktionsenhedPNr' => 0],
+	'an administrator person without a status date' => ['personBegraenset' => person(['statusdato' => null])],
+	'owner information that is not an object' => ['personEllerVirksomhedsadministratorErPersonEllerVirksomhedsoplysninger' => 'Boet'],
+	'an alternative address that is not an object' => ['personEllerVirksomhedsadministratorErPersonEllerVirksomhedsoplysninger' => administratorOther(['alternativAdresseLokalId_23_AlternativAdresseBegraenset_id_lokalId_ref' => 'c/o'])],
+	'an alternative address without a status' => ['personEllerVirksomhedsadministratorErPersonEllerVirksomhedsoplysninger' => administratorOther(['alternativAdresseLokalId_23_AlternativAdresseBegraenset_id_lokalId_ref' => ['status' => null]])],
+] as $invalid => $values) {
+	test('An administration with ' . $invalid . ' is rejected', function () use ($values): void {
+		scriptWithToken([administrationPage([administration(7001, 'adm-bad', $values)])]);
+		throws(InvalidResponseException::class, fn() => ejf()->getAdministrations([7001]));
+	});
+}
+
+
+// ----------------------------------------------------------------
 // Query documents
 // ----------------------------------------------------------------
 
-test('Every query document sent fits the bundled flexibleCurrent v3 schema and queries only the ownership and transfer roots', function (): void {
+test('Every query document sent fits the bundled flexibleCurrent v3 schema and queries only the ownership, transfer and administration roots and joins of the private-actor entities', function (): void {
 	$schema = GraphqlSchema::fromFile(\dirname(__DIR__, 2) . '/resources/bbr/FLEX_CURRENT_V003.schema.graphql');
 	check($schema->hasField('Query', 'EJFCustom_EjerskabBegraenset') && $schema->hasInputField('EJF_EjerskifteFilterInput', 'bestemtFastEjendomBFENr'), 'The bundled schema parses.');
 
 	$roots = [];
+	$joins = [];
 	foreach (\array_unique(transport()->sent) as $document) {
 		$stats = $schema->check($document);
 		check(\count($stats['roots']) === 1, 'Every request has exactly one root field.');
 		$roots[$stats['roots'][0]] = true;
+
+		\preg_match_all('/\b([A-Za-z0-9_]+_ref)\b/', $document, $matches);
+		foreach ($matches[1] as $join) {
+			$joins[$join] = true;
+		}
 	}
 	\ksort($roots);
+	\ksort($joins);
 
 	check(
-		\array_keys($roots) === ['EJFCustom_EjerskabBegraenset', 'EJF_Ejerskifte'],
-		'The service queries only the ownership and transfer roots that a private actor may use.'
+		\array_keys($roots) === ['EJFCustom_EjerskabBegraenset', 'EJFCustom_PersonEllerVirksomhedsadminiBegraenset', 'EJF_Ejerskifte'],
+		'The service queries only the ownership, administration and transfer roots that a private actor may use.'
+	);
+	// The schema also offers joins to the entities that only public authorities get, such as EJF_AlternativAdresse.
+	check(
+		\array_keys($joins) === ['alternativAdresseLokalId_23_AlternativAdresseBegraenset_id_lokalId_ref', 'handelsoplysningerLokalId_23_Handelsoplysninger_id_lokalId_ref'],
+		'The service follows only the reference joins to entities that a private actor may use.'
 	);
 });
 
