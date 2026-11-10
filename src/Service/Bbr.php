@@ -112,6 +112,10 @@ class Bbr extends BaseService {
 	 * - bfeCandidates lists every candidate, ordered by BFE number. evidence names how a candidate
 	 *   was found: ground_sfe, building_bpfg, building_ejerlejlighed, unit_ejerlejlighed or
 	 *   selected_unit_ejerlejlighed.
+	 * - When the buildings and units of the house number give no candidate, as for a side entrance
+	 *   of a building that BBR registers under another house number, the candidates come from the
+	 *   other buildings that the house number gives access to, with evidence access_ground_sfe,
+	 *   access_building_bpfg, access_building_ejerlejlighed or access_unit_ejerlejlighed.
 	 * - status tells how far the resolution got: unparseable, postcode_not_unique,
 	 *   street_ambiguous_or_not_found, house_number_not_unique, ambiguous_unit, no_bfe,
 	 *   ambiguous_bfe, primary_resolved_scope_incomplete or resolved.
@@ -267,6 +271,7 @@ class Bbr extends BaseService {
 		$addressSelection = $this->selectAddress($addresses, $parsed['unit']);
 		$candidates = $this->resolveBfeCandidates(
 			$houseNumberId,
+			self::nullableString($houseNumbers[0]['adgangTilBygning'] ?? null),
 			$addressSelection['selected'],
 			$effectiveAt
 		);
@@ -1193,13 +1198,21 @@ class Bbr extends BaseService {
 	 * - The candidates are the SFE of the grounds under the buildings of the house number, the
 	 *   BPFG and owner apartments of those buildings, and the owner apartments of their units, or
 	 *   of the units at the selected address when there is one.
+	 * - Only when these give no candidate, the same relations of the access buildings give the
+	 *   candidates. An access building is a building that the house number gives access to
+	 *   without being one of its buildings: The building that DAR names for it, the building of a
+	 *   BBR entrance reached from it, or the building of a unit at the selected address. The owner
+	 *   apartments of the units of access buildings count only when no address is selected.
 	 * - evidence names how a candidate was found: ground_sfe, building_bpfg,
-	 *   building_ejerlejlighed, unit_ejerlejlighed or selected_unit_ejerlejlighed.
+	 *   building_ejerlejlighed, unit_ejerlejlighed or selected_unit_ejerlejlighed, or through
+	 *   access buildings access_ground_sfe, access_building_bpfg, access_building_ejerlejlighed or
+	 *   access_unit_ejerlejlighed.
 	 * - selectedBfeNumber is the one candidate with selected_unit_ejerlejlighed, or else the only
 	 *   candidate; null otherwise.
 	 * - Candidates are ordered by BFE number.
 	 *
 	 * @param  string  $houseNumberId  DAR id of the house number.
+	 * @param  string|null  $accessBuildingId  BBR id of the building that DAR names for the house number, or null.
 	 * @param  array<string,mixed>|null  $selectedAddress  DAR address node that the typed address selects, or null.
 	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
 	 * @return array{
@@ -1210,6 +1223,7 @@ class Bbr extends BaseService {
 	 */
 	private function resolveBfeCandidates(
 		string $houseNumberId,
+		?string $accessBuildingId,
 		?array $selectedAddress,
 		string $effectiveAt
 	): array {
@@ -1226,44 +1240,10 @@ class Bbr extends BaseService {
 			)
 		);
 
-		$groundIds = [];
-		$propertyIds = [];
-		$evidence = [];
-
-		foreach ($buildings as $building) {
-			self::addUuid($groundIds, $building['grund'] ?? null);
-
-			$ownerApartmentId = self::nullableString($building['ejerlejlighed'] ?? null);
-			if ($ownerApartmentId !== null && self::isUuid($ownerApartmentId)) {
-				$propertyIds[$ownerApartmentId] = true;
-				$evidence[$ownerApartmentId]['building_ejerlejlighed'] = true;
-			}
-		}
-
-		$grounds = $this->fetchGroundsByIds(\array_keys($groundIds), $effectiveAt);
-		foreach ($grounds as $ground) {
-			$propertyId = self::nullableString($ground['bestemtFastEjendom'] ?? null);
-			if ($propertyId !== null && self::isUuid($propertyId)) {
-				$propertyIds[$propertyId] = true;
-				$evidence[$propertyId]['ground_sfe'] = true;
-			}
-		}
-
-		$buildingRelations = $this->fetchBuildingRelationsByIds(\array_keys($buildings), $effectiveAt);
-		foreach ($buildingRelations as $relation) {
-			$propertyId = self::nullableString($relation['bygningPaaFremmedGrund'] ?? null);
-			if ($propertyId !== null && self::isUuid($propertyId)) {
-				$propertyIds[$propertyId] = true;
-				$evidence[$propertyId]['building_bpfg'] = true;
-			}
-		}
-
-		$selectedUnitIds = [];
-		$unitIds = [];
-
+		$selectedUnits = null;
 		if ($selectedAddress !== null) {
 			$addressId = self::requiredUuid($selectedAddress['id_lokalId'] ?? null, 'DAR selected address id');
-			$units = self::keyById(
+			$selectedUnits = self::keyById(
 				$this->fetchAll(
 					$this->currentService,
 					$this->currentVersion,
@@ -1275,69 +1255,58 @@ class Bbr extends BaseService {
 					)
 				)
 			);
+		}
 
-			foreach (\array_keys($units) as $unitId) {
-				$unitIds[$unitId] = true;
-				$selectedUnitIds[$unitId] = true;
-			}
-		} else {
-			$units = $this->fetchByIdentifierBatches(
-				'BBR_Enhed',
-				'bygning',
-				\array_keys($buildings),
+		$candidates = $this->loadBfeCandidates(
+			$this->collectPropertyEvidence(
+				$buildings,
+				$selectedUnits !== null ? \array_keys($selectedUnits) : null,
+				'',
+				$effectiveAt
+			),
+			$effectiveAt
+		);
+
+		// BBR registers a building under one house number, so a side entrance with a house number
+		// of its own reaches its property only through the building it leads into.
+		if ($candidates === []) {
+			$accessBuildingIds = [];
+			self::addUuid($accessBuildingIds, $accessBuildingId);
+
+			$entrances = $this->fetchByIdentifierBatches(
+				'BBR_Opgang',
+				'adgangFraHusnummer',
+				[$houseNumberId],
 				$effectiveAt,
-				fn(string $field, array $ids, ?string $after): string => $this->buildUnitsByIdsQuery(
+				fn(string $field, array $ids, ?string $after): string => $this->buildEntrancesByIdsQuery(
 					$field,
 					$ids,
 					$effectiveAt,
 					$after
 				)
 			);
-
-			foreach (\array_keys($units) as $unitId) {
-				$unitIds[$unitId] = true;
-			}
-		}
-
-		$unitRelations = $this->fetchUnitRelationsByIds(\array_keys($unitIds), $effectiveAt);
-		foreach ($unitRelations as $relation) {
-			$propertyId = self::nullableString($relation['ejerlejlighed'] ?? null);
-			$unitId = self::nullableString($relation['enhed'] ?? null);
-
-			if ($propertyId === null || !self::isUuid($propertyId)) {
-				continue;
+			foreach ($entrances as $entrance) {
+				self::addUuid($accessBuildingIds, $entrance['bygning'] ?? null);
 			}
 
-			$propertyIds[$propertyId] = true;
-			$evidence[$propertyId][
-				$unitId !== null && isset($selectedUnitIds[$unitId])
-					? 'selected_unit_ejerlejlighed'
-					: 'unit_ejerlejlighed'
-			] = true;
-		}
-
-		$properties = $this->fetchPropertiesByIds(\array_keys($propertyIds), $effectiveAt);
-		$candidates = [];
-
-		foreach ($properties as $id => $property) {
-			$bfe = self::nullableInt($property['bfeNummer'] ?? null);
-			if ($bfe === null) {
-				throw new InvalidResponseException('BBR property candidate does not contain a valid BFE number.');
+			foreach ($selectedUnits ?? [] as $unit) {
+				self::addUuid($accessBuildingIds, $unit['bygning'] ?? null);
 			}
 
-			$typeCode = self::requiredString($property['ejendomstype'] ?? null, 'BBR property candidate type');
-			$candidates[] = [
-				'bfeNumber' => $bfe,
-				'propertyType' => self::propertyKind($typeCode),
-				'propertyRelationId' => $id,
-				'evidence' => \array_keys($evidence[$id] ?? []),
-			];
+			$accessBuildingIds = \array_diff_key($accessBuildingIds, $buildings);
+			if ($accessBuildingIds !== []) {
+				$candidates = $this->loadBfeCandidates(
+					$this->collectPropertyEvidence(
+						$this->fetchBuildingsByIds(\array_keys($accessBuildingIds), $effectiveAt),
+						// With a selected address only its units count, and their owner apartments were collected above.
+						$selectedUnits !== null ? [] : null,
+						'access_',
+						$effectiveAt
+					),
+					$effectiveAt
+				);
+			}
 		}
-
-		\usort(
-			$candidates,
-			static fn(array $a, array $b): int => $a['bfeNumber'] <=> $b['bfeNumber']
-		);
 
 		$selected = null;
 		$selectedUnitCandidates = \array_values(
@@ -1361,6 +1330,119 @@ class Bbr extends BaseService {
 			'candidates' => $candidates,
 			'selectedBfeNumber' => $selected,
 		];
+	}
+
+	/**
+	 * Collect the BBR property relations of buildings and units, each with the evidence that found it.
+	 *
+	 * Behavior:
+	 * - ground_sfe marks the SFE of the grounds under the buildings, and building_bpfg and
+	 *   building_ejerlejlighed the BPFG and owner apartments of the buildings.
+	 * - selected_unit_ejerlejlighed marks the owner apartments of the selected units, or
+	 *   unit_ejerlejlighed those of every unit of the buildings when selectedUnitIds is null.
+	 * - Every evidence name starts with the prefix.
+	 *
+	 * @param  array<string,array<string,mixed>>  $buildings  Raw BBR_Bygning nodes keyed by id; only grund and ejerlejlighed are read.
+	 * @param  list<string>|null  $selectedUnitIds  BBR ids of the units at the selected address, or null for every unit of the buildings.
+	 * @param  string  $prefix  Prefix of the evidence names, such as access_, or '' for none.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return array<string,array<string,bool>>  Evidence names as keys, under the BBR id of each property relation.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed.
+	 */
+	private function collectPropertyEvidence(
+		array $buildings,
+		?array $selectedUnitIds,
+		string $prefix,
+		string $effectiveAt
+	): array {
+		$groundIds = [];
+		$evidence = [];
+
+		foreach ($buildings as $building) {
+			self::addUuid($groundIds, $building['grund'] ?? null);
+
+			$ownerApartmentId = self::nullableString($building['ejerlejlighed'] ?? null);
+			if ($ownerApartmentId !== null && self::isUuid($ownerApartmentId)) {
+				$evidence[$ownerApartmentId][$prefix . 'building_ejerlejlighed'] = true;
+			}
+		}
+
+		$grounds = $this->fetchGroundsByIds(\array_keys($groundIds), $effectiveAt);
+		foreach ($grounds as $ground) {
+			$propertyId = self::nullableString($ground['bestemtFastEjendom'] ?? null);
+			if ($propertyId !== null && self::isUuid($propertyId)) {
+				$evidence[$propertyId][$prefix . 'ground_sfe'] = true;
+			}
+		}
+
+		$buildingRelations = $this->fetchBuildingRelationsByIds(\array_keys($buildings), $effectiveAt);
+		foreach ($buildingRelations as $relation) {
+			$propertyId = self::nullableString($relation['bygningPaaFremmedGrund'] ?? null);
+			if ($propertyId !== null && self::isUuid($propertyId)) {
+				$evidence[$propertyId][$prefix . 'building_bpfg'] = true;
+			}
+		}
+
+		$unitIds = $selectedUnitIds ?? \array_keys(
+			$this->fetchByIdentifierBatches(
+				'BBR_Enhed',
+				'bygning',
+				\array_keys($buildings),
+				$effectiveAt,
+				fn(string $field, array $ids, ?string $after): string => $this->buildUnitsByIdsQuery(
+					$field,
+					$ids,
+					$effectiveAt,
+					$after
+				)
+			)
+		);
+		$unitEvidence = $prefix . ($selectedUnitIds !== null ? 'selected_unit_ejerlejlighed' : 'unit_ejerlejlighed');
+
+		$unitRelations = $this->fetchUnitRelationsByIds($unitIds, $effectiveAt);
+		foreach ($unitRelations as $relation) {
+			$propertyId = self::nullableString($relation['ejerlejlighed'] ?? null);
+			if ($propertyId !== null && self::isUuid($propertyId)) {
+				$evidence[$propertyId][$unitEvidence] = true;
+			}
+		}
+
+		return $evidence;
+	}
+
+	/**
+	 * Load the BFE candidates of property relations, ordered by BFE number.
+	 *
+	 * @param  array<string,array<string,bool>>  $evidence  Evidence names as keys, under the BBR id of each property relation.
+	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
+	 * @return list<array{bfeNumber:int,propertyType:string,propertyRelationId:string,evidence:list<string>}>  One candidate per relation that BBR returns.
+	 * @throws \CitOmni\DanishPublicSectorData\Exception\PublicDataException  When a lookup fails or is malformed, or a candidate has no valid BFE number or an unknown property type.
+	 */
+	private function loadBfeCandidates(array $evidence, string $effectiveAt): array {
+		$properties = $this->fetchPropertiesByIds(\array_keys($evidence), $effectiveAt);
+		$candidates = [];
+
+		foreach ($properties as $id => $property) {
+			$bfe = self::nullableInt($property['bfeNummer'] ?? null);
+			if ($bfe === null) {
+				throw new InvalidResponseException('BBR property candidate does not contain a valid BFE number.');
+			}
+
+			$typeCode = self::requiredString($property['ejendomstype'] ?? null, 'BBR property candidate type');
+			$candidates[] = [
+				'bfeNumber' => $bfe,
+				'propertyType' => self::propertyKind($typeCode),
+				'propertyRelationId' => $id,
+				'evidence' => \array_keys($evidence[$id] ?? []),
+			];
+		}
+
+		\usort(
+			$candidates,
+			static fn(array $a, array $b): int => $a['bfeNumber'] <=> $b['bfeNumber']
+		);
+
+		return $candidates;
 	}
 
 	/**
@@ -3879,9 +3961,9 @@ GRAPHQL;
 	}
 
 	/**
-	 * Build the query document for one page of entrances by their id or the id of their building.
+	 * Build the query document for one page of entrances by their id, the id of their building or the DAR id of the house number they are reached from.
 	 *
-	 * @param  string  $field  id_lokalId or bygning.
+	 * @param  string  $field  id_lokalId, bygning or adgangFraHusnummer.
 	 * @param  list<string>  $ids  At most 100 ids.
 	 * @param  string  $effectiveAt  UTC effect time in the form 2026-01-31T12:00:00Z.
 	 * @param  string|null  $after  Cursor of the previous page, or null for the first page.
@@ -3895,7 +3977,7 @@ GRAPHQL;
 		string $effectiveAt,
 		?string $after
 	): string {
-		self::assertIdentifierField($field, ['id_lokalId', 'bygning']);
+		self::assertIdentifierField($field, ['id_lokalId', 'bygning', 'adgangFraHusnummer']);
 		$afterArg = self::afterArgument($after);
 		$list = self::gqlStringList($ids);
 

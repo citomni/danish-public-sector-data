@@ -114,6 +114,18 @@ Owner-apartment resolution uses the concrete DAR floor/door address and the corr
 unit/property relation. This allows the selected owner apartment to be distinguished from the
 underlying SFE at the same house number.
 
+BBR registers a building under one house number, so the side entrances of a care home or a
+block of flats can have house numbers of their own without any building of their own. When the
+buildings and units of the typed house number lead to no property, `resolveAddress()` follows
+the buildings that the house number gives access to: the building DAR names for it
+(`adgangTilBygning`), the buildings of the BBR entrances reached from it (`adgangFraHusnummer`),
+and the building of the unit at the selected address. Their candidates carry the evidence
+`access_ground_sfe`, `access_building_bpfg`, `access_building_ejerlejlighed` or
+`access_unit_ejerlejlighed`, and the usual rules apply: one candidate is selected, several are
+reported as `ambiguous_bfe`. Without a selected address the owner apartments in those buildings
+are candidates too, as they are for the buildings of the house number itself. An address whose
+own house number leads to a property sends no extra request.
+
 Current property data is loaded explicitly by BFE:
 
 ```php
@@ -169,6 +181,14 @@ without network requests:
 
 ```bash
 php tests/bbr-addresses/run.php
+```
+
+The property lookup of `resolveAddress()`, through the buildings of the house number and through
+the buildings it gives access to, has a suite of its own with scripted responses, which also
+checks its query documents against the bundled schema:
+
+```bash
+php tests/bbr-address-resolution/run.php
 ```
 
 ## Soil contamination lookup
